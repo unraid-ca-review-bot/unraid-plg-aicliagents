@@ -3,12 +3,14 @@
  * <module_context>
  *     <name>LifecycleLogService</name>
  *     <description>Persistent, durable lifecycle log for AICliAgents storage events. Survives reboots.</description>
- *     <dependencies>StoragePathResolver</dependencies>
- *     <constraints>Must NOT depend on LayerManifestService. Never calls error_log or Unraid notify on failure — silent false return only.</constraints>
+ *     <dependencies>StoragePathResolver, TraceContext</dependencies>
+ *     <constraints>Must NOT depend on LayerManifestService. Never calls error_log or Unraid notify on failure — silent false return only. TraceContext is an allowed exception to the no-deps rule: it is tiny, static and dependency-free (R-06 trace correlation) — it must never grow dependencies of its own.</constraints>
  * </module_context>
  */
 
 namespace AICliAgents\Services;
+
+require_once __DIR__ . '/TraceContext.php';
 
 class LifecycleLogService {
     public const LEVEL_INFO     = 'info';
@@ -46,13 +48,13 @@ class LifecycleLogService {
         // Auto-rotate before writing if over threshold
         self::rotateIfNeeded();
 
-        $ts      = date('Y-m-d\TH:i:s\Z', time());
-        $payJson = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($payJson === false) {
-            $payJson = '{}';
+        // R-06: merge the per-request trace id into the payload (via TraceContext
+        // directly, NOT via LogService — preserves the no-LogService constraint).
+        if (TraceContext::getId() !== null && !isset($payload['_trace'])) {
+            $payload['_trace'] = TraceContext::getId();
         }
 
-        $line = implode(' | ', [$ts, $level, $component, $event, $payJson]) . "\n";
+        $line = self::formatLine($level, $component, $event, $payload);
 
         $fd = @fopen($path, 'a');
         if ($fd === false) {
@@ -71,6 +73,25 @@ class LifecycleLogService {
         @fclose($fd);
 
         return ($written !== false && $written > 0);
+    }
+
+    /**
+     * Pure formatter: assembles a structured log line with a UTC timestamp.
+     * Extracted for testability — no I/O side effects.
+     *
+     * @param string   $level     One of the LEVEL_* constants.
+     * @param string   $component Logical component name.
+     * @param string   $event     Event identifier.
+     * @param array    $payload   Arbitrary key-value data.
+     * @param int|null $ts        Unix timestamp (defaults to now).
+     * @return string             The formatted log line (includes trailing newline).
+     */
+    public static function formatLine(string $level, string $component, string $event, array $payload, ?int $ts = null): string
+    {
+        $stamp   = gmdate('Y-m-d\TH:i:s\Z', $ts ?? time());
+        $payJson = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($payJson === false) { $payJson = '{}'; }
+        return implode(' | ', [$stamp, $level, $component, $event, $payJson]) . "\n";
     }
 
     /**

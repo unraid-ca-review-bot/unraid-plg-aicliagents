@@ -11,6 +11,11 @@
  *     notifications to once per (entity, state) per boot via /tmp/unraid-aicliagents/.boot_integrity_notified.
  *     Never calls exit() or throws exceptions -- returns classification arrays only.</constraints>
  * </module_context>
+ *
+ * @internal Storage-component internal (Epic #1310). The boot-integrity
+ *           classification + recovery is a PRIVATE concern of the storage component;
+ *           consumers read health/state via FileStorage::status(), not by calling
+ *           classifyEntity / runBootSweep directly.
  */
 
 namespace AICliAgents\Services;
@@ -28,6 +33,8 @@ class BootIntegrityService {
     public const STATE_UNTRACKED        = 'untracked';
     public const STATE_CORRUPT_LAYERS   = 'corrupt_layers';
     public const STATE_HOST_MISMATCH    = 'host_mismatch';
+    /** #1317: persist path not yet on a mounted durable fs — TRANSIENT, never a halt. */
+    public const STATE_UNAVAILABLE      = 'unavailable';
 
     private const COMPONENT      = 'BootIntegrityService';
     private const NOTIFIED_FILE  = '/tmp/unraid-aicliagents/.boot_integrity_notified';
@@ -124,6 +131,14 @@ class BootIntegrityService {
 
         if (empty($expectedLayers)) {
             if (empty($activeFiles) && empty($siblingFiles)) {
+                // Follow-on 1b: fold op_mount's LEGACY_FOUND probe into the single
+                // classifier. Legacy .img / raw-folder data with no managed layers
+                // must HALT (legacy_unmanaged → recovery card) rather than be read as
+                // genuine_fresh and mount an empty stack over the unmigrated data.
+                if (self::hasLegacyData($persistPath, $type, $id)) {
+                    $evidence['legacy_data'] = true;
+                    return ['state' => self::STATE_LEGACY_UNMANAGED, 'evidence' => $evidence];
+                }
                 return ['state' => self::STATE_GENUINE_FRESH, 'evidence' => $evidence];
             }
             if (empty($activeFiles)) {
@@ -147,13 +162,24 @@ class BootIntegrityService {
                 // Phase 4a: sha256 verify deferred to Phase 4b strict mode.
                 return ['state' => self::STATE_HEALTHY, 'evidence' => $evidence];
             }
-            // #1314: a missing EXPECTED layer is benign ONLY when (a) the on-disk layers already
-            // form a complete, self-consistent chain AND (b) every missing layer sits BELOW/outside
-            // that chain — a superseded base orphaned by a fresh chain or replaced by a consolidate.
-            // A missing layer whose seq is ABOVE the on-disk chain head is a LOST HEAD (the newest
-            // baked layer is gone); chain-completeness alone can't see that, but the manifest is the
-            // only record it ever existed — so it must still flag as real loss. (Pruning the stale
-            // superseded entries is #1315.)
+            // Follow-on 4: consult the write-ahead INTENT log FIRST. A surviving
+            // intent (only present after an interrupted consolidate) that lists every
+            // missing layer in its delete plan means those are INTENTIONAL prunes —
+            // benign, the kept consolidated layer holds their data. This is the
+            // primary, unambiguous recovery signal; the #1314/#1319 chain heuristics
+            // below are now the BACKSTOP for missing layers the intent doesn't explain.
+            $intent = self::readIntent($persistPath, $type, $id);
+            if (self::missingLayersAllIntentionallyPruned($missing, $intent)) {
+                $evidence['intent_pruned_count'] = $missingCount;
+                return ['state' => self::STATE_HEALTHY, 'evidence' => $evidence];
+            }
+            // BACKSTOP (#1314): a missing EXPECTED layer is benign ONLY when (a) the on-disk layers
+            // already form a complete, self-consistent chain AND (b) every missing layer sits
+            // BELOW/outside that chain — a superseded base orphaned by a fresh chain or replaced by a
+            // consolidate. A missing layer whose seq is ABOVE the on-disk chain head is a LOST HEAD
+            // (the newest baked layer is gone); chain-completeness alone can't see that, but the
+            // manifest is the only record it ever existed — so it must still flag as real loss.
+            // (Pruning the stale superseded entries is #1315.)
             if (self::isActiveChainComplete($activeBasenames)
                 && !self::missingLayersAboveChainHead($activeBasenames, $missing)) {
                 $evidence['superseded_count'] = $missingCount;
@@ -163,7 +189,17 @@ class BootIntegrityService {
             return ['state' => self::STATE_PARTIAL_LOSS, 'evidence' => $evidence];
         }
 
-        // expected non-empty, active empty
+        // expected non-empty, active empty.
+        // #1317: if the persist path is NOT on a mounted durable fs (e.g. ZFS-backed
+        // /boot mounts LATE in boot), the empty active set is an artefact of the
+        // pre-mount window, NOT data loss — return the transient STATE_UNAVAILABLE
+        // (never a halt). A later sweep, once the path is mounted, re-classifies for
+        // real. This distinguishes "parent not mounted yet" (findmnt finds no durable
+        // mount) from "mounted-but-empty" (a genuine total_loss, which still halts).
+        if (!self::isPersistDurablyMounted($persistPath)) {
+            $evidence['persist_unmounted'] = true;
+            return ['state' => self::STATE_UNAVAILABLE, 'evidence' => $evidence];
+        }
         if ($pathDrift || !empty($siblingFiles)) {
             if ($pathDrift) {
                 $evidence['manifest_path'] = $manifestPath;
@@ -171,6 +207,68 @@ class BootIntegrityService {
             return ['state' => self::STATE_PATH_DRIFT, 'evidence' => $evidence];
         }
         return ['state' => self::STATE_TOTAL_LOSS, 'evidence' => $evidence];
+    }
+
+    /**
+     * Follow-on 1b: pure predicate — does this persist dir hold UNMIGRATED legacy
+     * data (pre-squashfs `*.img` images or raw legacy home folders) with no managed
+     * `.sqsh` layers? Folds op_mount's old standalone LEGACY_FOUND probe
+     * (storage_ops.sh D-298 / D-342) into the single classifier so the central
+     * component is the one owner of "is it safe to mount an empty stack here?".
+     * The raw-folder signals are home-only — an agent persist dir legitimately
+     * contains subdirs.
+     */
+    /**
+     * #1317: PURE — is this fstype a DURABLE backing store (survives reboot)? Mirrors
+     * bash common.sh _durable_fstype_ok: VOLATILE (RAM/overlay) → false; EMPTY (path
+     * not on any mount yet) → false; everything else incl. zfs AND an unknown real
+     * disk → true (so a genuine loss on an exotic-but-mounted fs is never masked as
+     * "transient", only a truly-unmounted path is).
+     */
+    public static function durableFstypeOk(string $fstype): bool
+    {
+        switch ($fstype) {
+            case 'tmpfs': case 'ramfs': case 'devtmpfs': case 'overlay': case 'zram': case 'squashfs':
+                return false; // volatile
+            case '':
+                return false; // not on any mount yet
+            default:
+                return true;  // durable (zfs/ext4/xfs/btrfs/… + unknown real disks)
+        }
+    }
+
+    /**
+     * #1317: is the persist path on a mounted DURABLE filesystem RIGHT NOW? On ZFS-
+     * backed /boot the persistence dir mounts LATE in boot, so a sweep in the pre-mount
+     * window must NOT classify loss against an unmounted/empty path — classifyEntity
+     * returns the transient STATE_UNAVAILABLE instead.
+     */
+    private static function isPersistDurablyMounted(string $path): bool
+    {
+        if ($path === '') {
+            return false;
+        }
+        $fstype = trim((string) @shell_exec(
+            'findmnt --noheadings --output FSTYPE --target ' . escapeshellarg($path) . ' 2>/dev/null'
+        ));
+        return self::durableFstypeOk($fstype);
+    }
+
+    public static function hasLegacyData(string $persistPath, string $type, string $id): bool
+    {
+        if ($persistPath === '') {
+            return false;
+        }
+        if (is_file("$persistPath/aicli-agents.img")
+            || is_file("$persistPath/persistence/home_$id.img")
+            || is_file("$persistPath/home_$id.img")) {
+            return true;
+        }
+        if ($type === 'home'
+            && (is_dir("$persistPath/persistence/$id") || is_dir("$persistPath/$id"))) {
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -184,6 +282,57 @@ class BootIntegrityService {
      * @param array<int,string> $activeBasenames
      * @param array<int,string> $missingBasenames
      */
+    /**
+     * Follow-on 4: read the write-ahead consolidate INTENT for an entity, if a
+     * crashed op left one on the persist path. A surviving intent only exists after
+     * an interrupted destructive op (op_consolidate writes it before the deletes and
+     * clears it on success). Returns the raw JSON or null. Mirrors common.sh
+     * read_intent / _intent_path.
+     */
+    public static function readIntent(string $persistPath, string $type, string $id): ?string
+    {
+        if ($persistPath === '') {
+            return null;
+        }
+        $p = rtrim($persistPath, '/') . "/.aicli-intent-$type-$id.json";
+        if (!is_file($p)) {
+            return null;
+        }
+        $raw = @file_get_contents($p);
+        return ($raw === false || $raw === '') ? null : $raw;
+    }
+
+    /**
+     * Follow-on 4: PURE — are ALL the manifest-expected-but-missing layers accounted
+     * for as INTENTIONAL prunes in a surviving intent's delete plan? An interrupted
+     * consolidate's planned-delete layers are benign: the kept consolidated layer
+     * holds their data. Returns false on no/empty intent or empty missing-set, so the
+     * caller falls through to the #1314/#1319 chain-heuristic BACKSTOP. Mirrors bash
+     * intent_layer_is_intentional_prune: membership is anchored to the intent's
+     * "delete" array. F1 (WP#1325): a substring match over the whole JSON would also
+     * match the "keep" field, so the loss of the kept consolidated layer itself would
+     * be masked as an intentional prune — decode and test the delete plan only.
+     *
+     * @param array<int,string> $missingBasenames
+     */
+    public static function missingLayersAllIntentionallyPruned(array $missingBasenames, ?string $intentJson): bool
+    {
+        if ($intentJson === null || $intentJson === '' || empty($missingBasenames)) {
+            return false;
+        }
+        $decoded = json_decode($intentJson, true);
+        if (!is_array($decoded) || !isset($decoded['delete']) || !is_array($decoded['delete'])) {
+            return false; // malformed / no delete plan → fall through to the backstop
+        }
+        $deletePlan = $decoded['delete'];
+        foreach ($missingBasenames as $bn) {
+            if (!in_array($bn, $deletePlan, true)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public static function missingLayersAboveChainHead(array $activeBasenames, array $missingBasenames): bool {
         $activeMax = -1;
         foreach ($activeBasenames as $fn) {
@@ -230,8 +379,10 @@ class BootIntegrityService {
         usort($layers, static function ($a, $b) { return $a['seq'] <=> $b['seq']; });
 
         // Base must be self-contained: a consolidated (any seq) OR a delta at seq 1 (empty base).
+        // kind is necessarily 'consolidated'|'delta' (the only regex alternatives), so when the
+        // base is not consolidated it IS a delta — the seq===1 test alone covers the delta case.
         $base = $layers[0];
-        if (!($base['kind'] === 'consolidated' || ($base['kind'] === 'delta' && $base['seq'] === 1))) {
+        if (!($base['kind'] === 'consolidated' || $base['seq'] === 1)) {
             return false; // lowest layer is a mid-chain delta with no base beneath -> genuine gap
         }
         // Seqs must be contiguous from the base (no holes).
@@ -285,6 +436,13 @@ class BootIntegrityService {
                 'boot_integrity_entity',
                 array_merge(['entity' => $entity, 'state' => $state], $evidence)
             );
+
+            if ($state === self::STATE_UNAVAILABLE) {
+                // #1317: persist path not yet on a mounted durable fs (ZFS /boot mounts
+                // LATE in boot). Transient — recorded + logged above, but NO attention/
+                // notify/halt/clear; a later sweep (once mounted) classifies for real.
+                continue;
+            }
 
             if ($state !== self::STATE_HEALTHY && $state !== self::STATE_GENUINE_FRESH) {
                 $attentionCount++;

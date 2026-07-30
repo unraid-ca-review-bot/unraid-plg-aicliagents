@@ -22,6 +22,18 @@ mkdir -p /tmp/unraid-aicliagents
 
 # Source canonical path resolver (Phase 1 — Storage Durability Supervisor)
 source "/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/storage/resolve_paths.sh" 2>/dev/null || true
+# F6 (WP#1331): the SINGLE manifest writer (shutdown delta bake's manifest record).
+source "/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/storage/manifest_write.sh" 2>/dev/null || true
+# S-05 (#1352): durable degraded flag (dual-write tmpfs + boot config).
+source "/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/storage/degraded_state.sh" 2>/dev/null || true
+# R2 (CAPTURE_RESUME_ALL_CLOSE_PATHS): the shutdown-capture bridge.
+source "/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/storage/capture_resume.sh" 2>/dev/null || true
+
+# Budget (secs) for the pre-kill resume capture. Small slice of the shutdown
+# window — pass 1 (disk fallback) is fast + guaranteed; pass 2 (full clean
+# close) is best-effort within this budget. The bridge is hard-ceilinged at
+# budget+2s and `|| true` so it can NEVER block the array from stopping.
+CAPTURE_BUDGET=8
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] [EventStopping] $1" >> "$LOG"
@@ -160,6 +172,19 @@ run_full_stop() {
     [ $? -eq 124 ] && warn "Stop sequence timed out after ${SHUTDOWN_BUDGET}s."
 }
 
+# R2: capture resume ids for ALL live sessions BEFORE any kill/unmount sweep
+# (covers all three scenarios below). The disk fallback is saved for every
+# session and the full clean close is attempted within CAPTURE_BUDGET; the
+# existing kill/unmount sweep that follows is UNCHANGED (the unmount guarantee).
+# We set a short-lived guard marker so the delegated stop-plugin.sh does NOT run
+# a second long capture serially in the same shutdown (saveResumeId is
+# idempotent, but we must not stack budgets and blow the shutdown window).
+log "Capturing resume ids before kill sweep (budget ${CAPTURE_BUDGET}s)..."
+if declare -f _capture_resume_before_stop >/dev/null 2>&1; then
+    _capture_resume_before_stop "$CAPTURE_BUDGET"
+    : > /tmp/unraid-aicliagents/.resume_captured 2>/dev/null || true
+fi
+
 if needs_array "$STORAGE_CLASS"; then
     # ── Scenario 1: Storage on array/pool — full stop ──
     log "Storage depends on array/pool. Running full stop + persist..."
@@ -167,7 +192,14 @@ if needs_array "$STORAGE_CLASS"; then
     run_full_stop
 
     if [ "$IS_SHUTDOWN" = false ]; then
-        touch /tmp/unraid-aicliagents/.emergency_mode
+        # S-05 (#1352): dual-write — tmpfs .emergency_mode (existing consumers)
+        # + durable state/degraded.json (survives a recovery reboot, so the boot
+        # integrity sweep knows the prior session ended degraded).
+        if declare -f degraded_set >/dev/null 2>&1; then
+            degraded_set "array_stopped_storage_on_array"
+        else
+            touch /tmp/unraid-aicliagents/.emergency_mode
+        fi
         log "Emergency mode flag set (array stopped, server still running)."
         # Notify UI: home gone, agents gone (both on array), emergency mode active
         nchan_notify false false true
@@ -278,6 +310,19 @@ else
                 DELTA_NAME=$(atomic_write_layer "home" "$user" "$HOME_PERSIST" "$upper_dir" "delta" 2>/dev/null)
                 if [ -n "$DELTA_NAME" ]; then
                     log "  Saved $DELTA_NAME for $user."
+                    # Follow-on 3: record the manifest entry for the shutdown delta
+                    # IMMEDIATELY (mirror op_bake Step 7a) so the layer is TRACKED, not
+                    # untracked-until-reconcile. This is the LEAN variant — bake +
+                    # manifest record ONLY; it deliberately does NOT run op_bake's
+                    # refresh/reclaim (wrong under the shutdown time budget). addLayer is
+                    # idempotent + upserts by filename, so the next boot/reconcile sweep
+                    # re-recording the same layer is harmless.
+                    # F6 (WP#1331): the SINGLE manifest writer; lifecycle event gated on success.
+                    if manifest_record_layer "home" "$user" "$HOME_PERSIST" "$DELTA_NAME"; then
+                        lifecycle_log "info" "event_stopping" "shutdown_manifest_recorded" "{\"user\":\"$user\",\"sqsh\":\"$DELTA_NAME\"}" 2>/dev/null || true
+                    else
+                        lifecycle_log "warn" "event_stopping" "shutdown_manifest_record_failed" "{\"user\":\"$user\",\"sqsh\":\"$DELTA_NAME\"}" 2>/dev/null || true
+                    fi
                 else
                     warn "  Home delta bake failed for $user."
                 fi

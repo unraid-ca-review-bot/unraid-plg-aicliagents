@@ -117,9 +117,16 @@ function av2_secrets_schema(array $agent): array {
 
                         $installedVer = $agent['version'] ?? '0.0.0';
                         $agentCache = $versionCache[$id] ?? null;
-                        $channel = $agent['channel'] ?? 'latest';
-                        $channelVer = $agentCache['dist_tags'][$channel] ?? null;
-                        $latestVer = $channelVer ?: ($agentCache['dist_tags']['latest'] ?? 'unknown');
+                        $channel = $agent['channel'] ?? 'stable';
+                        $distTags = (array)($agentCache['dist_tags'] ?? []);
+                        if ($channel === 'pinned') {
+                            $channelVer = $agent['pinned'] ?? null;
+                        } elseif ($channel === 'beta') {
+                            $channelVer = $distTags['beta'] ?? ($distTags['next'] ?? null);
+                        } else {
+                            $channelVer = $distTags['stable'] ?? ($distTags['latest'] ?? null);
+                        }
+                        $latestVer = $channelVer ?: ($distTags['latest'] ?? 'unknown');
                         $versionKnown = ($installedVer && !in_array($installedVer, ['unknown','0.0.0','installed'], true));
                         $hasUpdate   = ($versionKnown && $channelVer && version_compare($channelVer, $installedVer) > 0);
                         $hasDowngrade = ($versionKnown && $channelVer && version_compare($channelVer, $installedVer) < 0);
@@ -307,7 +314,11 @@ function av2_secrets_schema(array $agent): array {
                         </div>
 
                         <?php if ($agent['is_installed']): ?>
-                        <div class="av2-strip" role="tablist">
+                        <?php /* WP #903 a11y: role="group", not "tablist" — the chips are
+                           aria-expanded disclosure toggles (accordion vocabulary), and
+                           tablist requires role="tab" children (axe aria-required-children,
+                           critical). group permits button/span children as-is. */ ?>
+                        <div class="av2-strip" role="group" aria-label="<?=htmlspecialchars($agent['name'], ENT_QUOTES, 'UTF-8')?> settings">
                             <button type="button" class="av2-chip" data-target="channel" title="Release channel" onclick="av2ChipToggle(this)"><?=$av2_chip_icons['channel']?><span class="av2-label">Channel</span></button>
 
                             <?php
@@ -340,8 +351,8 @@ function av2_secrets_schema(array $agent): array {
                             <div class="av2-panel" data-panel="channel">
                                 <h4>Release channel</h4>
                                 <div class="av2-seg" role="radiogroup">
-                                    <input type="radio" id="ch-latest-<?=$id?>" name="ch-<?=$id?>" value="latest" onchange="av2SetChannel('<?=$id?>', 'latest')" <?=$channel === 'latest' ? 'checked' : ''?>>
-                                    <label for="ch-latest-<?=$id?>">Stable</label>
+                                    <input type="radio" id="ch-stable-<?=$id?>" name="ch-<?=$id?>" value="stable" onchange="av2SetChannel('<?=$id?>', 'stable')" <?=$channel === 'stable' ? 'checked' : ''?>>
+                                    <label for="ch-stable-<?=$id?>">Stable</label>
                                     <?php if ($supportsBeta): ?>
                                     <input type="radio" id="ch-beta-<?=$id?>" name="ch-<?=$id?>" value="beta" onchange="av2SetChannel('<?=$id?>', 'beta')" <?=$channel === 'beta' ? 'checked' : ''?>>
                                     <label for="ch-beta-<?=$id?>">Beta</label>
@@ -498,7 +509,8 @@ function av2_secrets_schema(array $agent): array {
                              three are rendered as disabled placeholders (.av2-chip.disabled) so every
                              card has identical visual rhythm without implying functionality that isn't
                              available pre-install. -->
-                        <div class="av2-strip" role="tablist">
+                        <?php /* WP #903 a11y: role="group" — see installed-variant note above. */ ?>
+                        <div class="av2-strip" role="group" aria-label="<?=htmlspecialchars($agent['name'], ENT_QUOTES, 'UTF-8')?> settings">
                             <button type="button" class="av2-chip" data-target="channel" title="Release channel — pick a version, then install" onclick="av2ChipToggle(this)">
                                 <span class="av2-label">Channel</span>
                             </button>
@@ -514,13 +526,13 @@ function av2_secrets_schema(array $agent): array {
                             <div class="av2-panel" data-panel="channel">
                                 <h4>Release channel</h4>
                                 <div class="av2-seg" role="radiogroup">
-                                    <input type="radio" id="ch-latest-<?=$id?>" name="ch-<?=$id?>" value="latest" checked>
-                                    <label for="ch-latest-<?=$id?>">Stable</label>
+                                    <input type="radio" id="ch-stable-<?=$id?>" name="ch-<?=$id?>" value="stable" onchange="av2SetChannel('<?=$id?>', 'stable')" <?=$channel === 'stable' ? 'checked' : ''?>>
+                                    <label for="ch-stable-<?=$id?>">Stable</label>
                                     <?php if ($supportsBeta): ?>
-                                    <input type="radio" id="ch-beta-<?=$id?>" name="ch-<?=$id?>" value="beta">
+                                    <input type="radio" id="ch-beta-<?=$id?>" name="ch-<?=$id?>" value="beta" onchange="av2SetChannel('<?=$id?>', 'beta')" <?=$channel === 'beta' ? 'checked' : ''?>>
                                     <label for="ch-beta-<?=$id?>">Beta</label>
                                     <?php endif; ?>
-                                    <input type="radio" id="ch-pinned-<?=$id?>" name="ch-<?=$id?>" value="pinned">
+                                    <input type="radio" id="ch-pinned-<?=$id?>" name="ch-<?=$id?>" value="pinned" onchange="av2SetChannel('<?=$id?>', 'pinned')" <?=!empty($agent['pinned']) ? 'checked' : ''?>>
                                     <label for="ch-pinned-<?=$id?>">Pinned</label>
                                 </div>
 

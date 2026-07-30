@@ -6,12 +6,43 @@ PLUGIN_BIN="/usr/local/emhttp/plugins/unraid-aicliagents/bin"
 ZRAM_BASE="/tmp/unraid-aicliagents/zram_upper"
 DEBUG_LOG="/tmp/unraid-aicliagents/debug.log"
 
+# #1322: detect_backend.sh provides the GENUINE device test (entity_upper_mode /
+# backend_for) that _entity_paths uses for the zram-vs-disk upper-mode. It is a
+# self-contained, dependency-free pure-function lib — source it here (guarded) so it
+# is available everywhere common.sh is, not only where storagectl sources it.
+if ! declare -f entity_upper_mode >/dev/null 2>&1; then
+    _cmn_storage_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    if [ -f "$_cmn_storage_dir/detect_backend.sh" ]; then
+        # shellcheck source=detect_backend.sh
+        source "$_cmn_storage_dir/detect_backend.sh" 2>/dev/null || true
+    fi
+    unset _cmn_storage_dir
+fi
+
 # Ensure debug log directory exists
 mkdir -p "$(dirname "$DEBUG_LOG")"
 
 export PATH="$PLUGIN_BIN:$PATH"
 
 get_ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# ---------------------------------------------------------------------------
+# R-06 (#1370) trace correlation.
+# _trace_tag -> "[t:<id>] " when AICLI_TRACE_ID is inherited (exported by the
+# PHP exec sites / the supervisor's op dispatch), '' otherwise. Storage scripts
+# splice it into their log prefixes so a debug.log grep on [t:<id>] joins the
+# shell lines to the originating AJAX request.
+# ---------------------------------------------------------------------------
+_trace_tag() { printf '%s' "${AICLI_TRACE_ID:+[t:$AICLI_TRACE_ID] }"; }
+
+# cmn_log <LEVL> <CTX> <message...> — THE central debug-log writer for storage
+# scripts: "[ts] [LEVL] [CTX] [t:<id>] message". New code should use this (or a
+# per-script wrapper that includes $(_trace_tag)) instead of hand-rolled echoes.
+cmn_log() {
+    local _cl_level="${1:-INFO}" _cl_ctx="${2:-storage}"
+    shift 2 2>/dev/null || true
+    echo "[$(get_ts)] [$_cl_level] [$_cl_ctx] $(_trace_tag)$*" >> "$DEBUG_LOG"
+}
 
 # guard_path: Validate a path before destructive operations.
 # Usage: guard_path "/some/path" "description"
@@ -44,16 +75,24 @@ guard_path() {
     esac
 
     # User-configurable persistence paths under /mnt/. Allow any pool except the
-    # known-system tmpfs mounts that aren't real persistence (sized 1024k by
-    # Unraid for plugins like unassigned-devices). Rejecting only the explicit
+    # mounts that aren't valid persistence roots. Rejecting only the explicit
     # system mounts means Unraid user-pools (e.g. /mnt/cache, /mnt/cache_nvme,
     # /mnt/scratch_old, /mnt/zfs_pool, custom names from disks.ini) all work.
+    # S-02 (#1352): /mnt/disks and /mnt/addons are real Unassigned Devices mount
+    # roots (NOT tmpfs — the old comment was wrong); /mnt/addons is the UD-blessed
+    # path for plugin-owned devices. A sub-directory UNDER a mounted UD device is a
+    # valid persist target; the device mount point itself (/mnt/disks/<label>) and
+    # the bare roots are not — only a sub-path is useful, and requiring one avoids
+    # accepting the mount-point parents as target roots. /mnt/remotes (network
+    # shares) and /mnt/rootshare (Unraid root export) stay denied for persistence.
     if [ "$allowed" -ne 1 ]; then
         case "$path" in
-            /mnt/disks|/mnt/disks/*)       : ;;  # unassigned-devices tmpfs
-            /mnt/remotes|/mnt/remotes/*)   : ;;  # network shares tmpfs
-            /mnt/rootshare|/mnt/rootshare/*) : ;;
-            /mnt/addons|/mnt/addons/*)     : ;;
+            /mnt/disks/*/*)                 allowed=1 ;;  # UD block device sub-dir: /mnt/disks/<label>/<sub>
+            /mnt/addons/*/*)                allowed=1 ;;  # UD blessed plugin-owned device sub-dir
+            /mnt/disks|/mnt/disks/*)        : ;;  # bare UD root or device mount point — not a persist root
+            /mnt/addons|/mnt/addons/*)      : ;;  # bare UD root or device mount point — not a persist root
+            /mnt/remotes|/mnt/remotes/*)    : ;;  # network shares (CIFS/NFS) — refused for persistence
+            /mnt/rootshare|/mnt/rootshare/*) : ;; # Unraid root export — not a user data path
             /mnt/*/*)                       allowed=1 ;;  # any pool: /mnt/<name>/<sub>
             /mnt/disk[0-9]*)                allowed=1 ;;  # array disks: /mnt/disk1, /mnt/disk2, ...
         esac
@@ -65,6 +104,19 @@ guard_path() {
     fi
 
     return 0
+}
+
+# _durable_fstype_ok <fstype> -> 0 if the fstype is a DURABLE backing store (survives
+# reboot), 1 if VOLATILE (RAM/overlay). An unknown fstype errs DURABLE (return 0) so a
+# new/exotic REAL disk is never wrongly refused. Pure (no findmnt) → unit-testable.
+# #1317: zfs is durable (Unraid ZFS-backed /boot + ZFS pools) — it was falling through
+# to the "unknown fstype -> treating as durable" warn arm.
+_durable_fstype_ok() {
+    case "${1:-}" in
+        ext4|xfs|btrfs|zfs|vfat|exfat|f2fs|ntfs|fuseblk) return 0 ;;
+        tmpfs|ramfs|devtmpfs|overlay|zram|squashfs)      return 1 ;;
+        *)                                               return 0 ;;
+    esac
 }
 
 # _assert_persist_durable: Validate that a persistence path is on a durable filesystem.
@@ -83,16 +135,61 @@ _assert_persist_durable() {
         echo "[$(get_ts)] [ERR!] [_assert_persist_durable] findmnt failed or path not mounted: $path" >> "$DEBUG_LOG"
         return 1
     }
-    case "$fstype" in
-        ext4|xfs|btrfs|vfat|exfat|f2fs|ntfs|fuseblk)
-            return 0 ;;
-        tmpfs|ramfs|devtmpfs|overlay|zram|squashfs)
-            echo "[$(get_ts)] [ERR!] [_assert_persist_durable] path '$path' is on $fstype (non-durable) — bake refused" >> "$DEBUG_LOG"
-            return 1 ;;
-        *)
-            echo "[$(get_ts)] [WARN] [_assert_persist_durable] unknown fstype '$fstype' for '$path' — treating as durable" >> "$DEBUG_LOG"
-            return 0 ;;
-    esac
+    if _durable_fstype_ok "$fstype"; then
+        # Keep the observability warn for genuinely-UNKNOWN fstypes (known durable ones
+        # incl. zfs are silent now).
+        case "$fstype" in
+            ext4|xfs|btrfs|zfs|vfat|exfat|f2fs|ntfs|fuseblk) ;;
+            *) echo "[$(get_ts)] [WARN] [_assert_persist_durable] unknown fstype '$fstype' for '$path' — treating as durable" >> "$DEBUG_LOG" ;;
+        esac
+        return 0
+    fi
+    echo "[$(get_ts)] [ERR!] [_assert_persist_durable] path '$path' is on $fstype (non-durable) — refused" >> "$DEBUG_LOG"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# S-09 (#1352): FAT32 per-file size-cap preflight. FAT32 (vfat) caps a single
+# file at 4,294,967,295 bytes — a bake/consolidate whose output squashfs would
+# exceed it fails mid-mksquashfs with a confusing write error. Check BEFORE the
+# bake: the cap is derived from the persist path's REAL fstype via findmnt —
+# never from a path prefix.
+FAT32_MAX_FILE_BYTES=4294967295
+
+# _fat32_cap_check <persist> <src_dir> -> 0 ok / 1 over-cap (only ever 1 when the
+# persist fstype is vfat AND the projected size is within 5% of the cap; the
+# squashfs output compresses, so a du within 5% of the raw cap is a hard danger
+# signal, not a borderline case). Sets _FAT32_PROJECTED_BYTES for the caller's
+# diagnostics. AICLI_ITEST_PERSIST_FSTYPE forces the fstype (test hook, mirrors
+# the AICLI_PROC_MOUNTS precedent) so the guard is unit-testable without vfat.
+_fat32_cap_check() {
+    local persist="${1:-}" src="${2:-}" fst proj cap
+    _FAT32_PROJECTED_BYTES=0
+    fst="${AICLI_ITEST_PERSIST_FSTYPE:-$(findmnt --noheadings --output FSTYPE --target "$persist" 2>/dev/null || echo '')}"
+    [ "$fst" = "vfat" ] || return 0
+    [ -d "$src" ] || return 0
+    proj=$(du -sb "$src" 2>/dev/null | awk '{print $1}')
+    case "$proj" in ''|*[!0-9]*) proj=0 ;; esac
+    _FAT32_PROJECTED_BYTES="$proj"
+    cap=$(( FAT32_MAX_FILE_BYTES * 95 / 100 ))   # refuse within 5% of the cap
+    [ "$proj" -lt "$cap" ]
+}
+
+# _fat32_cap_refuse <type> <id> <component> — the shared exit-4 refusal tail for
+# the FAT32 cap preflight: defer-reason marker (fat32_size_cap), lifecycle event,
+# dynamix notification. Caller exits 4 (precondition failed) afterwards.
+_fat32_cap_refuse() {
+    local _type="${1:-}" _id="${2:-}" _component="${3:-storage}"
+    write_defer_reason "$_type" "$_id" "fat32_size_cap"
+    lifecycle_log "error" "$_component" "fat32_size_cap" \
+        "{\"type\":\"$_type\",\"id\":\"$_id\",\"projected_bytes\":${_FAT32_PROJECTED_BYTES:-0},\"cap_bytes\":$FAT32_MAX_FILE_BYTES}" 2>/dev/null || true
+    if [ -x /usr/local/emhttp/plugins/dynamix/scripts/notify ]; then
+        /usr/local/emhttp/plugins/dynamix/scripts/notify -i warning \
+            -s "AICliAgents: FAT32 file size limit" \
+            -d "Home directory approaching FAT32 file size limit — recommend graduating to a POSIX pool (see Storage tab)." \
+            2>/dev/null || true
+    fi
+    return 0
 }
 
 # check_disk_space: Ensure sufficient space before writing.
@@ -183,6 +280,119 @@ _layer_next_seq() {
     printf '%d' "$((max + 1))"
 }
 
+# _prepare_busy_snapshot_roll <type> <id> <marker>
+#
+# Mark the start of a busy bake while holding the same short mount-operation
+# lock used by op_mount.  The sentinel distinguishes "this is the first busy
+# snapshot" from "op_mount cleared the marker while the bake was running".
+_prepare_busy_snapshot_roll() {
+    local type="${1:-}" id="${2:-}" marker="${3:-}" lock_fd
+    [ "$type" = "home" ] && [ -n "$id" ] && [ -n "$marker" ] || return 1
+    [ "$(basename -- "$marker")" = ".bake_busy_snapshot_${type}_${id//[^a-zA-Z0-9_-]/_}" ] || return 1
+
+    exec {lock_fd}>"$(mount_op_lock_path "$type" "$id")" 2>/dev/null || return 1
+    if ! flock -w 30 "$lock_fd"; then
+        exec {lock_fd}>&-
+        return 1
+    fi
+    if [ ! -e "$marker" ]; then
+        printf '%s' '__none__' > "$marker" || {
+            flock -u "$lock_fd"
+            exec {lock_fd}>&-
+            return 1
+        }
+    fi
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
+}
+
+# _replace_busy_snapshot <type> <id> <persist> <marker> <current>
+#
+# A busy home cannot reclaim its upper directory, so each bake is a complete
+# snapshot of the same upper plus newer writes. The previous busy snapshot was
+# deliberately never mounted as a lower and is therefore fully superseded by
+# the current one. Replace its manifest reference first, then remove the file.
+# A crash between those operations leaves harmless untracked debris that the
+# reconciler can recover; it never leaves a manifest reference to a missing file.
+# Reading/updating the marker and removing the superseded snapshot all happen
+# under the mount-operation lock. If op_mount cleared the marker first, return 2
+# and retain both snapshots: the prior layer may now be mounted and immutable.
+_replace_busy_snapshot() {
+    local type="${1:-}" id="${2:-}" persist="${3:-}" marker="${4:-}" current="${5:-}"
+    local previous lock_fd
+    [ "$type" = "home" ] || return 1
+    [ -n "$id" ] && [ -n "$persist" ] && [ -n "$marker" ] || return 1
+    [ "$(basename -- "$marker")" = ".bake_busy_snapshot_${type}_${id//[^a-zA-Z0-9_-]/_}" ] || return 1
+    [ "$(basename -- "$current")" = "$current" ] || return 1
+    case "$current" in  "home_${id}_delta_"*.sqsh) : ;; *) return 1 ;; esac
+    [ -f "$persist/$current" ] || return 1
+
+    exec {lock_fd}>"$(mount_op_lock_path "$type" "$id")" 2>/dev/null || return 1
+    if ! flock -w 30 "$lock_fd"; then
+        exec {lock_fd}>&-
+        return 1
+    fi
+    if [ ! -f "$marker" ]; then
+        flock -u "$lock_fd"
+        exec {lock_fd}>&-
+        return 2
+    fi
+    previous="$(cat "$marker" 2>/dev/null || true)"
+    if [ "$previous" = '__none__' ]; then
+        printf '%s' "$current" > "$marker" || {
+            flock -u "$lock_fd"
+            exec {lock_fd}>&-
+            return 1
+        }
+        _REPLACED_BUSY_SNAPSHOT=""
+        flock -u "$lock_fd"
+        exec {lock_fd}>&-
+        return 0
+    fi
+    [ "$previous" != "$current" ] || {
+        flock -u "$lock_fd"
+        exec {lock_fd}>&-
+        return 1
+    }
+    [ "$(basename -- "$previous")" = "$previous" ] || {
+        flock -u "$lock_fd"
+        exec {lock_fd}>&-
+        return 1
+    }
+    case "$previous" in
+        "home_${id}_delta_"*.sqsh) : ;;
+        *)
+            flock -u "$lock_fd"
+            exec {lock_fd}>&-
+            return 1
+            ;;
+    esac
+    [ -f "$persist/$previous" ] || {
+        flock -u "$lock_fd"
+        exec {lock_fd}>&-
+        return 1
+    }
+    manifest_remove_layer "$type" "$id" "$previous" || {
+        flock -u "$lock_fd"
+        exec {lock_fd}>&-
+        return 1
+    }
+    rm -f -- "$persist/$previous" || {
+        flock -u "$lock_fd"
+        exec {lock_fd}>&-
+        return 1
+    }
+    printf '%s' "$current" > "$marker" || {
+        flock -u "$lock_fd"
+        exec {lock_fd}>&-
+        return 1
+    }
+    _REPLACED_BUSY_SNAPSHOT="$previous"
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
+    return 0
+}
+
 # _layer_discover_sorted <persist> <type> <id> -> newest-first FULL PATHS, one/line.
 # Single source of discovery ordering (seq desc, then dt desc). A tab separates the
 # sort key from the path so `cut -f2-` recovers the path verbatim (paths have no tabs).
@@ -239,17 +449,24 @@ _consolidate_max_layers() {
     printf '%d' "$raw"
 }
 
-# _entity_paths <type> <id> <persist> — single source of the fstype->upper/work
-# derivation + mount-point template shared by the trio (now storage_ops.sh) and
-# storagectl. Sets globals: UPPER_DIR, WORK_DIR, MNT_POINT, ENTITY_UPPER_MODE.
-# vfat / unknown persist fstype -> ZRAM upper (buffers writes off Flash); any
-# durable fstype -> direct disk upper. PURE path computation — no dir creation,
-# no zram init (callers do those side-effects). Must match mount_stack's historic
-# logic exactly so a bake/consolidate writes from the same upper a mount reads.
+# _entity_paths <type> <id> <persist> — single source of the upper/work derivation +
+# mount-point template shared by the trio (now storage_ops.sh) and storagectl. Sets
+# globals: UPPER_DIR, WORK_DIR, MNT_POINT, ENTITY_UPPER_MODE.
+# #1322: the zram-vs-disk upper-mode is now the GENUINE device test
+# (entity_upper_mode -> backend_for: removable/USB → zram off Flash; durable → disk),
+# replacing the old vfat-fstype proxy (a vfat-formatted SSD is not a wear-limited
+# stick). Falls back to the legacy fstype proxy only if detect_backend is somehow
+# unavailable. PURE path computation — no dir creation, no zram init (callers do those
+# side-effects). Must keep bake/consolidate writing from the same upper a mount reads.
 _entity_paths() {
-    local _ep_type="$1" _ep_id="$2" _ep_persist="$3" _ep_fst
-    _ep_fst=$(findmnt --noheadings --output FSTYPE --target "$_ep_persist" 2>/dev/null || echo '')
-    if [ "$_ep_fst" = "vfat" ] || [ -z "$_ep_fst" ]; then
+    local _ep_type="$1" _ep_id="$2" _ep_persist="$3" _ep_mode
+    if declare -f entity_upper_mode >/dev/null 2>&1; then
+        _ep_mode="$(entity_upper_mode "$_ep_persist")"
+    else
+        local _ep_fst; _ep_fst=$(findmnt --noheadings --output FSTYPE --target "$_ep_persist" 2>/dev/null || echo '')
+        { [ "$_ep_fst" = "vfat" ] || [ -z "$_ep_fst" ]; } && _ep_mode="zram" || _ep_mode="disk"
+    fi
+    if [ "$_ep_mode" = "zram" ]; then
         ENTITY_UPPER_MODE="zram"
         UPPER_DIR="$ZRAM_BASE/${_ep_type}s/$_ep_id/upper"
         WORK_DIR="$ZRAM_BASE/${_ep_type}s/$_ep_id/work"
@@ -292,19 +509,95 @@ _entity_paths() {
 # exe on the fs (covers agent overlays and any directly-held handle).
 #
 # Best-effort: runs as root. Transient PIDs vanishing mid-scan are ignored.
+# Classify a mount holder. Args: <pid> [cmdline_override].
+# Returns 0 if the process is the plugin's OWN secret-service-daemon or its
+# session dbus-daemon (whose only hold is upper-dir files that survive a
+# lower-only consolidation remount). Returns 1 otherwise. The cmdline override
+# (NUL- or space-separated) lets unit tests drive it without real PIDs.
+_holder_is_infra_daemon() {
+    local _pid="$1" _cmd="${2:-}"
+    if [ -z "$_cmd" ] && [ -n "$_pid" ]; then
+        _cmd="$(tr '\0' ' ' < "/proc/$_pid/cmdline" 2>/dev/null)"
+    else
+        _cmd="$(printf '%s' "$_cmd" | tr '\0' ' ')"
+    fi
+    case "$_cmd" in
+        */secret-service/secret-service-daemon*|*/src/secret-service/secret-service-daemon*) return 0 ;;
+        *dbus-daemon*--session*unraid-aicliagents/secret-service/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 home_mount_in_use() {
     local mnt="$1"
     [ -n "$mnt" ] || return 1
-    # Fast path: any open fd / cwd / exe / mmap physically on the fs.
-    fuser -sm "$mnt" 2>/dev/null && return 0
     # Live interactive session: a ttyd whose argv carries AICLI_HOME=<mount>.
+    # This is the authoritative "busy" signal and is never filtered.
     local _pid
     for _pid in $(pgrep -x ttyd 2>/dev/null); do
         if tr '\0' '\n' < "/proc/$_pid/cmdline" 2>/dev/null | grep -qxF "AICLI_HOME=$mnt"; then
             return 0
         fi
     done
+    # Open fd / cwd / exe / mmap holders, EXCLUDING the plugin's own infra
+    # daemons (keyring.json lives in the upper dir; a lower-only consolidation
+    # remount keeps their fds valid). If a non-infra holder remains -> busy.
+    # fuser unavailable or error -> treat as busy (fail safe); rc 1 (no holders) -> proceed to not-busy.
+    command -v fuser >/dev/null 2>&1 || return 0
+    local _fuser_pids _fuser_rc
+    _fuser_pids="$(fuser -m "$mnt" 2>/dev/null)"; _fuser_rc=$?
+    # rc 0 = holders exist; rc 1 = none; anything else = error -> fail safe (busy)
+    if [ "$_fuser_rc" -ne 0 ] && [ "$_fuser_rc" -ne 1 ]; then return 0; fi
+    local _holders
+    _holders="$(printf '%s' "$_fuser_pids" | tr -s ' \t' '\n' | grep -E '^[0-9]+$' || true)"
+    for _pid in $_holders; do
+        _holder_is_infra_daemon "$_pid" || return 0
+    done
     return 1
+}
+
+# WP #1309 / ADR 0001: the busy-arbiter for the overlay-remount chokepoint.
+#
+# _proc_mounts_path -> the /proc/mounts source. Overridable via AICLI_PROC_MOUNTS
+# (a TEST hook ONLY — mirrors the AICLI_ITEST_GUARD / AICLI_CONSOLIDATE_MAX_LAYERS
+# precedent) so the arbiter below is unit-testable without a real kernel mount.
+_proc_mounts_path() { printf '%s' "${AICLI_PROC_MOUNTS:-/proc/mounts}"; }
+
+# _overlay_present_at <mnt> -> 0 (true) IFF /proc/mounts shows an overlay mounted
+# at exactly <mnt>. Mirrors PHP isHomeMountHealthy's "^overlay <mnt> overlay" probe.
+_overlay_present_at() {
+    local mnt="${1:-}"
+    [ -n "$mnt" ] || return 1
+    awk -v m="$mnt" '$2==m && $3=="overlay"{f=1} END{exit f?0:1}' "$(_proc_mounts_path)" 2>/dev/null
+}
+
+# _mount_teardown_arbiter <mnt> — THE single busy-arbiter for the overlay
+# (re)mount chokepoint (WP #1309; spec docs/specs/OP_MOUNT_BUSY_REMOUNT_SAFETY.md).
+# Safely release an existing mount before a fresh overlay bind on the SAME
+# upper/work, and NEVER do `umount -l` followed by an immediate rebind — that is
+# the copy-up-poison path (a lazy umount only detaches from the namespace and
+# defers releasing upper/work, so a fresh overlay double-binds the same upper →
+# kernel "undefined behaviour", new-file create returns ENOENT).
+#
+# Uses ONLY `mountpoint`, a single SYNCHRONOUS `umount`, and a /proc/mounts
+# overlay probe, so it is fully PATH-stubbable for unit tests. Return codes map
+# straight onto storagectl's exit contract:
+#   0  released, or never mounted              -> caller binds a fresh overlay
+#   2  busy (umount refused) + live overlay    -> caller DEFERS (exit 2); the
+#      upper holds all the data, only the lower refresh waits for the next idle
+#   1  busy + NOT a healthy overlay (phantom)  -> caller errors (exit 1)
+_mount_teardown_arbiter() {
+    local mnt="${1:-}"
+    [ -n "$mnt" ] || return 0
+    mountpoint -q "$mnt" 2>/dev/null || return 0     # not mounted -> safe to bind fresh
+    if umount "$mnt" 2>/dev/null; then               # REAL (non-lazy) umount ONLY
+        return 0                                      # released -> safe to bind fresh
+    fi
+    # umount refused: the mount is BUSY. NEVER lazy-umount-then-rebind.
+    if _overlay_present_at "$mnt"; then
+        return 2                                      # keep the live overlay; defer the refresh
+    fi
+    return 1                                          # busy + phantom -> unsafe to remount
 }
 
 # WP #1263 (#7): canonical per-entity overlay-mount-op lock path.
@@ -381,7 +674,9 @@ _mounted_lower_count() {
 # without opening the per-failure file.
 #
 # Flash wear footprint: ~5 KB per failure, capped at 50 files. Trivial.
-FAILURE_DIR="/boot/config/plugins/unraid-aicliagents/failures"
+# #1254: AICLI_FAILURES_DIR redirects failure snapshots off USB flash for the L3.5
+# suite (test-only; unset in production -> the flash path).
+FAILURE_DIR="${AICLI_FAILURES_DIR:-/boot/config/plugins/unraid-aicliagents/failures}"
 
 # snapshot_failure <type> <id> <exit_code> <source>
 # Best-effort — never fails, always returns 0.
@@ -767,19 +1062,493 @@ bake_via_overlay_merge() {
     return 0
 }
 
+# Canonical defer-reason vocabulary — the SINGLE source (ADR 0001 finding #5).
+# Previously the strings were split across common.sh (write), storagectl.sh
+# (read into JSON .defer_reason) and TaskService.php (user-facing message) with
+# no shared definition. write_defer_reason validates against this set; storagectl
+# surfaces the raw string; PHP TaskService maps it to a message. KEEP IN SYNC.
+#   mount_busy                      — a live session / open fd holds the mount (mount, bake, consolidate)
+#   busy_cooldown                   — home busy + within the per-session bake cooldown (op_bake)
+#   sqlite_backup_deferred          — a SQLite .backup was locked / timed out (bake, consolidate)
+#   consolidate_lowerdir_incomplete — live overlay short vs on-disk layers (op_consolidate, WP #1278)
+#   bake_lock_held                  — consolidate found the per-entity bake lock held (bake wins)
+#   bake_landed_during_consolidate  — a delta baked during the unlocked mksquashfs window
+#   target_not_mounted              — persist path's backing mount absent (UD device may mount late) (op_mount, S-02 #1352)
+#   fat32_size_cap                  — projected layer would exceed the FAT32 4 GiB per-file cap (bake/consolidate exit 4, S-09 #1352)
+#   upper_not_empty                 — graduate found unflushed files in the upper after the flush+consolidate (op_graduate exit 2, S-10 #1354)
+#   graduate_precondition           — graduate precondition failed (exit 4 — wrong device/engine/backend, no layers, or pt dir occupied) (op_graduate, S-10 #1354)
+AICLI_DEFER_REASONS="mount_busy busy_cooldown sqlite_backup_deferred consolidate_lowerdir_incomplete bake_lock_held bake_landed_during_consolidate target_not_mounted fat32_size_cap upper_not_empty graduate_precondition"
+
+# ---------------------------------------------------------------------------
+# S-03 (#1352): defer-marker TTL. A defer-reason marker is a point-in-time
+# diagnostic, not durable state — a marker older than the TTL is STALE (its op
+# either retried since or was abandoned) and must be silently ignored by readers
+# (storagectl _read_defer_reason, PHP FileStorage::peekDeferReason) and reaped by
+# the supervisor's reconcile tick. Precedence mirrors _consolidate_max_layers:
+# AICLI_DEFER_MARKER_TTL_H env (test hook) > cfg key defer_marker_ttl_h > 24.
+_defer_marker_ttl_h() {
+    local raw="" cfg="/boot/config/plugins/unraid-aicliagents/unraid-aicliagents.cfg"
+    if [ -n "${AICLI_DEFER_MARKER_TTL_H:-}" ]; then
+        raw="$AICLI_DEFER_MARKER_TTL_H"
+    elif [ -f "$cfg" ]; then
+        raw="$(grep -oP '^defer_marker_ttl_h="?\K[0-9]+' "$cfg" 2>/dev/null | head -1)"
+    fi
+    case "$raw" in
+        ''|*[!0-9]*) raw=24 ;;
+    esac
+    [ "$raw" -lt 1 ] && raw=1
+    printf '%d' "$raw"
+}
+
+# _defer_marker_fresh <marker_path> -> 0 (true) IFF the marker exists and its
+# mtime is within the TTL. Readers treat a non-fresh marker as absent.
+# (BSD-stat fallback only so the L2 unit also runs on a dev Mac; prod is GNU.)
+_defer_marker_fresh() {
+    local marker="${1:-}" mtime now ttl_s
+    [ -n "$marker" ] && [ -f "$marker" ] || return 1
+    mtime=$(stat -c '%Y' "$marker" 2>/dev/null || stat -f '%m' "$marker" 2>/dev/null) || return 1
+    case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+    now=$(date +%s)
+    ttl_s=$(( $(_defer_marker_ttl_h) * 3600 ))
+    [ $(( now - mtime )) -lt "$ttl_s" ]
+}
+
+# ---------------------------------------------------------------------------
+# Write-ahead intent log (Epic #1310 #1320). A destructive storage op writes a
+# fsync'd intent marker on the persist path BEFORE it starts (recording its plan:
+# what it keeps, what it deletes) and clears it on success. A marker that SURVIVES
+# means the op was interrupted; its recorded plan lets recovery distinguish an
+# INTENTIONAL prune (a layer the op was replacing — safe) from a REAL loss (a
+# layer that vanished with no intent — halt). This makes crash recovery
+# unambiguous; the boot-integrity heuristics (#1314/#1319) remain the backstop.
+_intent_path() { printf '%s/.aicli-intent-%s-%s.json' "${1%/}" "$2" "$3"; }   # persist type id
+
+# write_intent <persist> <type> <id> <json> — atomic + fsync'd (tmp → sync → rename).
+write_intent() {
+    local p; p="$(_intent_path "$1" "$2" "$3")"
+    { printf '%s' "$4" > "$p.tmp" && sync "$p.tmp" 2>/dev/null; mv -f "$p.tmp" "$p"; } 2>/dev/null || true
+}
+read_intent()  { cat "$(_intent_path "$1" "$2" "$3")" 2>/dev/null || true; }   # persist type id
+clear_intent() { rm -f  "$(_intent_path "$1" "$2" "$3")" 2>/dev/null || true; }   # persist type id
+
+# _intent_delete_segment <intent_json> -> echoes ONLY the contents of the intent's
+# "delete":[ ... ] array (between the brackets), or empty if there is no delete
+# array. F1 (WP#1325): membership tests MUST run against this segment, never the
+# whole JSON — the kept consolidated layer's basename appears in the "keep" field
+# quoted identically to the delete entries, so a whole-JSON substring match would
+# mask the loss of the keep layer itself as an "intentional prune". Pure parameter
+# expansion (no jq); layer basenames never contain '[' or ']'.
+_intent_delete_segment() {
+    case "$1" in
+        *'"delete":['*) : ;;       # has a delete array
+        *) return 0 ;;             # no delete plan -> empty (nothing intentional)
+    esac
+    local _seg="${1#*\"delete\":[}"   # drop everything up to & including "delete":[
+    printf '%s' "${_seg%%]*}"          # keep up to the first closing ]
+}
+
+# intent_layer_is_intentional_prune <intent_json> <layer_basename> -> 0 (true) if
+# the intent records this layer in its DELETE plan (its quoted basename appears in
+# the "delete" array), i.e. its absence is an intentional prune, not data loss.
+# Anchored to the delete segment so the "keep" layer can never be masked (F1).
+intent_layer_is_intentional_prune() {
+    case "$(_intent_delete_segment "$1")" in *"\"$2\""*) return 0 ;; *) return 1 ;; esac
+}
+
+# Test-only DETERMINISTIC SIGKILL hook (Epic #1310 Follow-on 4 L3.5). A no-op in
+# production — fires only when AICLI_ITEST_SIGKILL_WINDOW matches <window>, which
+# ONLY the integration harness's it_sigkill_mid_op sets. When it fires it signals
+# the harness (touch the sentinel) that the op has REACHED this exact window, then
+# sleeps so the harness can process-group-kill it deterministically — proving crash
+# recovery at each window without racing a fast op. Guarded so it can never sleep on
+# a real box (env unset → instant return 0).
+_itest_sigkill_window() {
+    [ -n "${AICLI_ITEST_SIGKILL_WINDOW:-}" ] || return 0
+    [ "${AICLI_ITEST_SIGKILL_WINDOW}" = "${1:-}" ] || return 0
+    [ -n "${AICLI_ITEST_SIGKILL_SENTINEL:-}" ] && : > "$AICLI_ITEST_SIGKILL_SENTINEL" 2>/dev/null || true
+    sleep "${AICLI_ITEST_SIGKILL_SLEEP:-30}"
+}
+
 # write_defer_reason <type> <id> <reason>
 # Writes a single-line reason marker for callers (StorageMountService / TaskService)
-# to disambiguate the three legitimate exit-2 paths (mount_busy / sqlite_backup_deferred
-# / consolidate_lock_held). Best-effort — failure to write does not abort the bake.
-# Path: /tmp/unraid-aicliagents/.bake_defer_reason_${type}_${id}
+# to disambiguate the legitimate exit-2 paths. Best-effort — failure to write does
+# not abort the bake. Path: /tmp/unraid-aicliagents/.bake_defer_reason_${type}_${id}
 # PHP side is responsible for unlink-after-read so stale reasons don't bleed across runs.
+# Validates <reason> against AICLI_DEFER_REASONS — an unlisted reason still writes
+# (non-breaking) but emits a stderr warning so a new caller can't silently invent a
+# reason PHP won't recognise.
 write_defer_reason() {
     local type="${1:-}"
     local id="${2:-}"
     local reason="${3:-unknown}"
     [ -n "$type" ] && [ -n "$id" ] || return 0
+    case " $AICLI_DEFER_REASONS " in
+        *" $reason "*) : ;;
+        *) echo "[write_defer_reason] WARN: unlisted defer reason '$reason' (not in AICLI_DEFER_REASONS — add it + a TaskService.php message)" >&2 ;;
+    esac
     local sanitised_id="${id//[^a-zA-Z0-9_-]/_}"
     local marker="/tmp/unraid-aicliagents/.bake_defer_reason_${type}_${sanitised_id}"
     # Truncate to a single short line; reason should be a stable identifier.
     printf '%s\n' "$reason" > "$marker" 2>/dev/null || true
+}
+
+# _op_defer <type> <id> <component> <event> <reason> [payload_json]   (#1312)
+# THE shared guarded-mutation DEFER tail, run by EVERY exit-2 defer site in op_bake
+# AND op_consolidate (the two critical mutation hot paths): emit the op's "deferred"
+# lifecycle event, write the defer-reason marker, then `exit 2` — the code the
+# supervisor reads as "deferred, retry when idle" (NOT a failure, so the failure
+# counter is untouched). The mutation CORES legitimately differ (a delta write vs a
+# mksquashfs merge) and stay separate; this centralises only the part that MUST stay
+# identical — the defer CONTRACT: the reason marker is always written BEFORE the exit,
+# and the exit code is always 2 (never 1), so the two paths can never drift apart.
+# Callers keep their op-specific side-effects (busy-cooldown stamp, update_task_status,
+# a human log line) inline around the call. Omitting [payload_json] emits a default
+# {type,id,reason} object; [level] defaults to "info". Ends in `exit 2`, so the
+# subshell/op terminates here.
+_op_defer() {
+    local _type="$1" _id="$2" _component="$3" _event="$4" _reason="$5" _payload="${6:-}" _level="${7:-info}"
+    [ -n "$_payload" ] || _payload="{\"type\":\"$_type\",\"id\":\"$_id\",\"reason\":\"$_reason\"}"
+    lifecycle_log "$_level" "$_component" "$_event" "$_payload" 2>/dev/null || true
+    write_defer_reason "$_type" "$_id" "$_reason"
+    exit 2
+}
+
+# ===========================================================================
+# Batch-bake CPU / IO deprioritization (BATCH_BAKE_DEPRIORITIZE.md)
+# ---------------------------------------------------------------------------
+# The squashfs bake (mksquashfs -comp xz) is the heaviest CPU burst the plugin
+# emits, plus a sync/sha256/mv I/O spike. On a hybrid CPU (e.g. 12700K) with a
+# VM pinned to the P-cores it starves the guest. These helpers make the bake a
+# well-behaved background job: nice 19, ionice idle, pinned to efficiency cores
+# when the CPU is hybrid (else a thread cap that leaves host headroom), and a
+# capped mksquashfs -processors. Everything is derived from sysfs at runtime and
+# cached per boot — NOTHING about core counts/IDs is hardcoded.
+#
+# Env overrides (all default to auto):
+#   AICLI_BATCH_NICE        nice level            (default 19)
+#   AICLI_BATCH_IONICE      ionice class spec     (default c3 -> -c3 idle)
+#   AICLI_BATCH_CPUS        explicit taskset list (non-empty -> pin there;
+#                                                  "" set -> no pin; overrides detect)
+#   AICLI_BATCH_PROCESSORS  explicit mksquashfs -processors count
+#   AICLI_BATCH_DISABLE=1   emit nothing / inject nothing (byte-for-byte legacy)
+# ===========================================================================
+
+_BATCH_CACHE_DIR="/tmp/unraid-aicliagents/cache"
+_BATCH_CACHE_FILE="${_BATCH_CACHE_DIR}/batch_cpus.cache"
+
+# _batch_online_cpus <sysfs_root> — print online cpu ids (one per line).
+# Honors cpu/online range list when present; falls back to every cpuN dir.
+_batch_online_cpus() {
+    local root="$1" line id a b
+    if [ -r "$root/online" ]; then
+        IFS=',' read -ra _ranges < <(cat "$root/online" 2>/dev/null)
+        for line in "${_ranges[@]}"; do
+            if [[ "$line" == *-* ]]; then
+                a="${line%%-*}"; b="${line##*-}"
+                for ((id=a; id<=b; id++)); do printf '%s\n' "$id"; done
+            elif [ -n "$line" ]; then
+                printf '%s\n' "$line"
+            fi
+        done
+        return 0
+    fi
+    for d in "$root"/cpu[0-9]*; do
+        [ -d "$d" ] || continue
+        id="${d##*/cpu}"
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
+        # If an online flag exists and says 0, skip; cpu0 usually has no flag.
+        if [ -r "$d/online" ] && [ "$(cat "$d/online" 2>/dev/null)" = "0" ]; then
+            continue
+        fi
+        printf '%s\n' "$id"
+    done | sort -n
+}
+
+# _batch_compact_ranges — read ids (one per line, sorted) from stdin, print a
+# compact "a-b c" range string (for the log line / taskset).
+_batch_compact_ranges() {
+    local out="" start="" prev="" n
+    while read -r n; do
+        [ -n "$n" ] || continue
+        if [ -z "$start" ]; then start="$n"; prev="$n"; continue; fi
+        if [ "$n" -eq $((prev + 1)) ]; then prev="$n"; continue; fi
+        if [ "$start" -eq "$prev" ]; then out+="${out:+ }$start"; else out+="${out:+ }$start-$prev"; fi
+        start="$n"; prev="$n"
+    done
+    if [ -n "$start" ]; then
+        if [ "$start" -eq "$prev" ]; then out+="${out:+ }$start"; else out+="${out:+ }$start-$prev"; fi
+    fi
+    printf '%s' "$out"
+}
+
+# _batch_detect_cpus [sysfs_root]
+# Classify ONLINE cpus and print the efficiency-core id list (compact ranges,
+# e.g. "16-19"), or empty if the machine is homogeneous. Result cached per boot.
+# Layered detection, first decisive signal wins:
+#   (a) cpu/types/ dir  — *atom* = efficiency, *core* = performance (read cpulist)
+#   (b) cpuN/cpu_capacity — >=2 distinct values -> lowest = efficiency (big.LITTLE)
+#   (c) SMT siblings + max freq — efficiency = cpus that are BOTH non-SMT
+#       (1 thread sibling) AND in the lower freq tier, ONLY if >=2 distinct classes.
+_batch_detect_cpus() {
+    local root="${1:-/sys/devices/system/cpu}"
+    local use_cache=0
+    [ "$root" = "/sys/devices/system/cpu" ] && use_cache=1
+
+    if [ "$use_cache" -eq 1 ] && [ -r "$_BATCH_CACHE_FILE" ]; then
+        cat "$_BATCH_CACHE_FILE"
+        return 0
+    fi
+
+    local result
+    result="$(_batch_detect_cpus_impl "$root")"
+
+    if [ "$use_cache" -eq 1 ]; then
+        mkdir -p "$_BATCH_CACHE_DIR" 2>/dev/null || true
+        printf '%s' "$result" > "$_BATCH_CACHE_FILE" 2>/dev/null || true
+    fi
+    printf '%s' "$result"
+}
+
+# _batch_detect_cpus_impl <sysfs_root> — uncached pure classifier (testable).
+_batch_detect_cpus_impl() {
+    local root="$1"
+    local -a online=()
+    local _o
+    while IFS= read -r _o; do [ -n "$_o" ] && online+=("$_o"); done < <(_batch_online_cpus "$root")
+    [ "${#online[@]}" -ge 1 ] || { printf ''; return 0; }
+
+    # ----- (a) cpu/types/ : Intel hybrid exposes atom/core type dirs ----------
+    if [ -d "$root/types" ]; then
+        local td eff="" perf="" name
+        for td in "$root"/types/*/; do
+            [ -d "$td" ] || continue
+            name="$(basename "$td")"
+            if [[ "$name" == *atom* ]] && [ -r "$td/cpulist" ]; then
+                eff="$(cat "$td/cpulist" 2>/dev/null)"
+            elif [[ "$name" == *core* ]] && [ -r "$td/cpulist" ]; then
+                perf="$(cat "$td/cpulist" 2>/dev/null)"
+            fi
+        done
+        if [ -n "$eff" ] && [ -n "$perf" ]; then
+            # Normalize the kernel cpulist (already compact) to our sorted form.
+            _batch_expand_cpulist "$eff" | sort -n | _batch_compact_ranges
+            return 0
+        fi
+    fi
+
+    # ----- (b) cpu_capacity : >=2 distinct values -> lowest is efficiency ------
+    local have_cap=1 cpu cap
+    local -A cap_of=()
+    local -A caps_seen=()
+    for cpu in "${online[@]}"; do
+        if [ -r "$root/cpu$cpu/cpu_capacity" ]; then
+            cap="$(cat "$root/cpu$cpu/cpu_capacity" 2>/dev/null)"
+            [ -n "$cap" ] || { have_cap=0; break; }
+            cap_of[$cpu]="$cap"; caps_seen[$cap]=1
+        else
+            have_cap=0; break
+        fi
+    done
+    if [ "$have_cap" -eq 1 ] && [ "${#caps_seen[@]}" -ge 2 ]; then
+        local mincap=""
+        for cap in "${!caps_seen[@]}"; do
+            if [ -z "$mincap" ] || [ "$cap" -lt "$mincap" ]; then mincap="$cap"; fi
+        done
+        for cpu in "${online[@]}"; do
+            [ "${cap_of[$cpu]}" = "$mincap" ] && printf '%s\n' "$cpu"
+        done | sort -n | _batch_compact_ranges
+        return 0
+    fi
+
+    # ----- (c) SMT siblings + max freq ---------------------------------------
+    # For each online cpu: sibling count (thread_siblings_list) and max freq.
+    local sib freq nsib
+    local -A nsib_of=() freq_of=()
+    local -A freq_seen=()
+    for cpu in "${online[@]}"; do
+        nsib=1
+        if [ -r "$root/cpu$cpu/topology/thread_siblings_list" ]; then
+            sib="$(cat "$root/cpu$cpu/topology/thread_siblings_list" 2>/dev/null)"
+            nsib="$(_batch_expand_cpulist "$sib" | grep -c .)"
+            [ "$nsib" -ge 1 ] || nsib=1
+        fi
+        freq=0
+        if [ -r "$root/cpu$cpu/cpufreq/cpuinfo_max_freq" ]; then
+            freq="$(cat "$root/cpu$cpu/cpufreq/cpuinfo_max_freq" 2>/dev/null)"
+        elif [ -r "$root/cpu$cpu/cpufreq/scaling_max_freq" ]; then
+            freq="$(cat "$root/cpu$cpu/cpufreq/scaling_max_freq" 2>/dev/null)"
+        fi
+        [ -n "$freq" ] || freq=0
+        nsib_of[$cpu]="$nsib"; freq_of[$cpu]="$freq"; freq_seen[$freq]=1
+    done
+
+    # A lower freq tier exists only if >=2 distinct freq values.
+    local maxfreq=""
+    for freq in "${!freq_seen[@]}"; do
+        if [ -z "$maxfreq" ] || [ "$freq" -gt "$maxfreq" ]; then maxfreq="$freq"; fi
+    done
+
+    # efficiency candidate = non-SMT (nsib==1) AND below the top freq tier.
+    local -a eff_cpus=()
+    for cpu in "${online[@]}"; do
+        if [ "${nsib_of[$cpu]}" -eq 1 ] && [ "${freq_of[$cpu]}" -lt "$maxfreq" ]; then
+            eff_cpus+=("$cpu")
+        fi
+    done
+
+    # Heterogeneity guard: only call it hybrid if we found a genuine second class
+    # (at least one efficiency cpu AND at least one non-efficiency cpu).
+    if [ "${#eff_cpus[@]}" -ge 1 ] && [ "${#eff_cpus[@]}" -lt "${#online[@]}" ]; then
+        printf '%s\n' "${eff_cpus[@]}" | sort -n | _batch_compact_ranges
+        return 0
+    fi
+
+    printf ''
+}
+
+# _batch_expand_cpulist <list> — expand a kernel cpulist ("0-3,5 16-19") to one
+# id per line (unsorted; caller sorts).
+_batch_expand_cpulist() {
+    local list="$1" part a b id
+    IFS=',' read -ra _parts <<< "${list// /,}"
+    for part in "${_parts[@]}"; do
+        part="${part// /}"
+        [ -n "$part" ] || continue
+        if [[ "$part" == *-* ]]; then
+            a="${part%%-*}"; b="${part##*-}"
+            for ((id=a; id<=b; id++)); do printf '%s\n' "$id"; done
+        else
+            printf '%s\n' "$part"
+        fi
+    done
+}
+
+# _batch_processors_for_threads <T> — PURE thread-count formula (homogeneous path).
+# processors = clamp(floor(T*0.25),1,8) then min(that, max(1,T-2)).
+# Examples: T=4->1, T=8->2, T=20->5, T=64->8.
+_batch_processors_for_threads() {
+    local t="${1:-1}" p
+    [ "$t" -ge 1 ] 2>/dev/null || t=1
+    p=$(( t / 4 ))                       # floor(T*0.25)
+    [ "$p" -lt 1 ] && p=1
+    [ "$p" -gt 8 ] && p=8
+    local headroom=$(( t - 2 ))
+    [ "$headroom" -lt 1 ] && headroom=1
+    [ "$p" -gt "$headroom" ] && p="$headroom"
+    printf '%s' "$p"
+}
+
+# _batch_count_list <compact-range-string> — count ids in "16-19 22" form.
+_batch_count_list() {
+    _batch_expand_cpulist "${1//,/ }" | grep -c .
+}
+
+# _batch_plan — resolve the bake plan into globals (called by _batch_prefix /
+# _batch_mksquashfs_args). Sets:
+#   _BATCH_CPUS       taskset cpu list (compact) or "" for no pin
+#   _BATCH_PROCESSORS mksquashfs -processors count
+#   _BATCH_PIN        "yes"|"no"
+#   _BATCH_ECORES     compact ecore list or "none" (for logging)
+#   _BATCH_T          online thread count (for logging in homogeneous case)
+_batch_plan() {
+    local nproc_count ecores
+    _BATCH_PIN="no"; _BATCH_CPUS=""; _BATCH_ECORES="none"; _BATCH_T=""
+
+    # Online thread count (sysfs-derived; nproc as a fallback).
+    nproc_count="$(_batch_online_cpus /sys/devices/system/cpu | grep -c .)"
+    [ "$nproc_count" -ge 1 ] 2>/dev/null || nproc_count="$(command -v nproc >/dev/null 2>&1 && nproc || echo 1)"
+    [ "$nproc_count" -ge 1 ] 2>/dev/null || nproc_count=1
+    _BATCH_T="$nproc_count"
+
+    # Explicit CPU override: non-empty -> pin there; empty-but-set -> no pin.
+    if [ "${AICLI_BATCH_CPUS+set}" = "set" ]; then
+        if [ -n "$AICLI_BATCH_CPUS" ]; then
+            if [[ "$AICLI_BATCH_CPUS" =~ ^[0-9]+([,-][0-9]+)*$ ]]; then
+                _BATCH_CPUS="$AICLI_BATCH_CPUS"; _BATCH_PIN="yes"; _BATCH_ECORES="$AICLI_BATCH_CPUS"
+                ecores=""   # suppress auto-detect when explicitly overridden
+            else
+                cmn_log WARN batch-plan "AICLI_BATCH_CPUS='$AICLI_BATCH_CPUS' is not a valid cpu-list — ignored"
+                ecores="$(_batch_detect_cpus)"
+                if [ -n "$ecores" ]; then
+                    _BATCH_CPUS="$ecores"; _BATCH_PIN="yes"; _BATCH_ECORES="$ecores"
+                fi
+            fi
+        else
+            ecores=""   # empty-but-set -> no pin, suppress auto-detect
+        fi
+    else
+        ecores="$(_batch_detect_cpus)"
+        if [ -n "$ecores" ]; then
+            _BATCH_CPUS="$ecores"; _BATCH_PIN="yes"; _BATCH_ECORES="$ecores"
+        fi
+    fi
+
+    # Processors.
+    if [ -n "${AICLI_BATCH_PROCESSORS:-}" ]; then
+        _BATCH_PROCESSORS="$AICLI_BATCH_PROCESSORS"
+    elif [ "$_BATCH_PIN" = "yes" ]; then
+        local ne; ne="$(_batch_count_list "$_BATCH_CPUS")"
+        [ "$ne" -ge 1 ] 2>/dev/null || ne=1
+        [ "$ne" -gt 8 ] && ne=8
+        _BATCH_PROCESSORS="$ne"
+    else
+        _BATCH_PROCESSORS="$(_batch_processors_for_threads "$nproc_count")"
+    fi
+}
+
+# _batch_prefix — print the available subset of
+#   nice -n <N> ionice -c <class> [taskset -c <cpus>]
+# Each tool guarded by `command -v` (missing -> omitted, never a failure).
+# Emits nothing when AICLI_BATCH_DISABLE=1.
+_batch_prefix() {
+    [ "${AICLI_BATCH_DISABLE:-0}" = "1" ] && { printf ''; return 0; }
+    _batch_plan
+    local nice_lvl="${AICLI_BATCH_NICE:-19}"
+    local ionice_spec="${AICLI_BATCH_IONICE:-c3}"
+    local out=""
+
+    if command -v nice >/dev/null 2>&1; then
+        out+="nice -n ${nice_lvl} "
+    fi
+    if command -v ionice >/dev/null 2>&1; then
+        # ionice_spec "c3" -> "-c3"; "c2n7" -> "-c2 -n7" support via simple parse.
+        local iflags=""
+        case "$ionice_spec" in
+            c*n*) iflags="-c ${ionice_spec#c}"; iflags="${iflags/n/ -n }" ;;
+            c*)   iflags="-c ${ionice_spec#c}" ;;
+            *)    iflags="$ionice_spec" ;;
+        esac
+        out+="ionice ${iflags} "
+    fi
+    if [ "$_BATCH_PIN" = "yes" ] && [ -n "$_BATCH_CPUS" ] && command -v taskset >/dev/null 2>&1; then
+        out+="taskset -c ${_BATCH_CPUS// /,} "
+    fi
+    # Trim trailing space.
+    printf '%s' "${out% }"
+}
+
+# _batch_mksquashfs_args <existing_args> — echo existing args, appending
+# "-processors <N>" ONLY if not already present and not disabled.
+_batch_mksquashfs_args() {
+    local existing="${1:-}"
+    if [ "${AICLI_BATCH_DISABLE:-0}" = "1" ]; then printf '%s' "$existing"; return 0; fi
+    case " $existing " in
+        *" -processors "*) printf '%s' "$existing"; return 0 ;;
+    esac
+    _batch_plan
+    printf '%s' "${existing}${existing:+ }-processors ${_BATCH_PROCESSORS}"
+}
+
+# _batch_log_line — one-shot human log describing the resolved plan (stderr).
+_batch_log_line() {
+    [ "${AICLI_BATCH_DISABLE:-0}" = "1" ] && return 0
+    _batch_plan
+    local nice_lvl="${AICLI_BATCH_NICE:-19}" ionice_spec="${AICLI_BATCH_IONICE:-c3}"
+    if [ "$_BATCH_PIN" = "yes" ]; then
+        printf '[batch] ecores=%s pin=yes processors=%s nice=%s ionice=%s\n' \
+            "$_BATCH_ECORES" "$_BATCH_PROCESSORS" "$nice_lvl" "$ionice_spec" >&2
+    else
+        printf '[batch] ecores=none pin=no processors=%s (T=%s) nice=%s ionice=%s\n' \
+            "$_BATCH_PROCESSORS" "$_BATCH_T" "$nice_lvl" "$ionice_spec" >&2
+    fi
 }

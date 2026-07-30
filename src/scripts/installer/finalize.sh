@@ -64,13 +64,34 @@ fi
 
 # --- PHP Post-Install Tasks ---
 log_step "Initializing plugin services..."
+# Follow-on #1: the plugin VERSION upgrade is the explicit format-migration
+# trigger. The version-gated FileStorage::migrateFormat call lives in a SCRIPT
+# FILE (not an inline php -r) so its namespaced facade calls aren't mangled by
+# bash backslash handling (publish anti-pattern check). It MUST run BEFORE the
+# version is saved below so it can read the OLD version. (Today migrateFormat is a
+# no-op beyond the gate; the slow btrfs→squashfs conversion stays BACKGROUNDED —
+# see D-308.)
+php /usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/installer/format-migrate.php "$VERSION" 9>&- > /dev/null 2>&1
+
 php -r "
 require_once '/usr/local/emhttp/plugins/unraid-aicliagents/src/includes/AICliAgentsManager.php';
 aicli_migrate_home_path();
 aicli_cleanup_legacy();
 aicli_boot_resurrection();
 saveAICliConfig(['version' => '$VERSION']);
-" > /dev/null 2>&1
+" 9>&- > /dev/null 2>&1
+
+# #74: cleanup intentionally stops the old supervisor before replacing source.
+# Do not report install success until the new daemon owns its pidfile and has a
+# fresh heartbeat. A later WebUI request remains a self-heal backstop, not the
+# primary restart mechanism for headless installs.
+# Close installer lock fd 9 in the child. SupervisorService starts a daemon
+# below PHP; without this redirection the daemon inherits the flock forever and
+# every subsequent plugin update reports "Another install is running".
+if ! php /usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/installer/supervisor-ready.php 9>&- > /dev/null 2>&1; then
+    log_error "Storage supervisor did not become ready after installation."
+    exit 1
+fi
 log_ok "Services initialized. Plugin updated to v$VERSION."
 
 # --- Agent Version Check Cron ---
@@ -88,6 +109,29 @@ CRON
 /usr/local/sbin/update_cron 2>/dev/null || true
 log_ok "Agent version check scheduled ($SCHEDULE)."
 
+# --- Plugin Health Check Cron (R-09, Feature #1372) ---
+log_step "Registering plugin health check schedule..."
+HEALTH_CRON_FILE="/etc/cron.d/unraid-aicliagents.health-check"
+HEALTH_SCRIPT="$EMHTTP_DEST/src/scripts/healthcheck.php"
+# Key absent -> default every 30 min; key present but EMPTY -> user disabled it
+# (mirrors ConfigService::updateHealthCheckCron semantics).
+if grep -q '^health_check_schedule=' /boot/config/plugins/unraid-aicliagents/unraid-aicliagents.cfg 2>/dev/null; then
+    HEALTH_SCHEDULE=$(grep -oP 'health_check_schedule="\K[^"]*' /boot/config/plugins/unraid-aicliagents/unraid-aicliagents.cfg 2>/dev/null | head -n1)
+else
+    HEALTH_SCHEDULE="*/30 * * * *"
+fi
+if [ -n "$HEALTH_SCHEDULE" ]; then
+    cat > "$HEALTH_CRON_FILE" <<CRON
+# AICliAgents: plugin health check schedule
+$HEALTH_SCHEDULE /usr/bin/php $HEALTH_SCRIPT &> /dev/null
+CRON
+    log_ok "Plugin health check scheduled ($HEALTH_SCHEDULE)."
+else
+    rm -f "$HEALTH_CRON_FILE"
+    log_ok "Plugin health check disabled by config."
+fi
+/usr/local/sbin/update_cron 2>/dev/null || true
+
 # Verify UI entry points (D-186: Ensure entry points exist for emhttp)
 cd "$EMHTTP_DEST"
 MISSING_ENTRY=0
@@ -99,4 +143,3 @@ for f in AICliAgents.page AICliAgentsManager.page AICliAjax.php ArrayStopWarning
 done
 [ "$MISSING_ENTRY" -gt 0 ] && log_status "  > Restored $MISSING_ENTRY missing UI entry point(s)."
 cd - > /dev/null
-

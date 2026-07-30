@@ -128,6 +128,9 @@ FD_SHA256="2b6bfaae8c48f12050813c2ffe1884c61ea26e750d803df9c9114550a314cd14"
 RG_TAR="ripgrep-14.1.0-x86_64-unknown-linux-musl.tar.gz"
 RG_URL="https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/$RG_TAR"
 RG_SHA256="f84757b07f425fe5cf11d87df6644691c644a5cd2348a2c670894272999d3ba7"
+GIT_LFS_TAR="git-lfs-linux-amd64-v3.7.0.tar.gz"
+GIT_LFS_URL="https://github.com/git-lfs/git-lfs/releases/download/v3.7.0/$GIT_LFS_TAR"
+GIT_LFS_SHA256="e7ebba491af8a54e560be3a00666fa97e4cf2bbbb223178a0934b8ef74cf9bed"
 
 install_tool() {
     local tar=$1 url=$2 name=$3 expected_sha=$4
@@ -162,6 +165,7 @@ install_tool() {
 
 install_tool "$FD_TAR" "$FD_URL" "fd" "$FD_SHA256"
 install_tool "$RG_TAR" "$RG_URL" "rg" "$RG_SHA256"
+install_tool "$GIT_LFS_TAR" "$GIT_LFS_URL" "git-lfs" "$GIT_LFS_SHA256"
 
 # --- 4. squashfs-tools (mksquashfs/unsquashfs) ---
 # D-304: Ensure SquashFS tools are available for the new storage architecture.
@@ -260,10 +264,11 @@ log_step "Agent proxy wrappers..."
 create_proxy() {
     local cmd=$1 pkg_path=$2
     local wrapper="$BIN_DEST/$cmd"
+    local wrapper_tmp="$wrapper.tmp.$$"
     local target="$EMHTTP_DEST/agents/$pkg_path"
     local bin_dest="$BIN_DEST"
 
-    cat <<'PROXYEOF' | sed -e "s|__BIN_DEST__|${bin_dest}|g" -e "s|__TARGET__|${target}|g" -e "s|__CMD__|${cmd}|g" -e "s|__PKG_PATH__|${pkg_path}|g" > "$wrapper"
+    cat <<'PROXYEOF' | sed -e "s|__BIN_DEST__|${bin_dest}|g" -e "s|__TARGET__|${target}|g" -e "s|__CMD__|${cmd}|g" -e "s|__PKG_PATH__|${pkg_path}|g" > "$wrapper_tmp"
 #!/bin/bash
 # AICliAgents Proxy Wrapper for __CMD__
 # The entry point is baked at plugin-install time, but npm packages occasionally
@@ -303,7 +308,8 @@ else
     exit 127
 fi
 PROXYEOF
-    chmod +x "$wrapper"
+    chmod +x "$wrapper_tmp"
+    mv -f "$wrapper_tmp" "$wrapper"
     ln -sf "$wrapper" "/usr/local/bin/$cmd"
 }
 
@@ -323,8 +329,10 @@ create_proxy "nanocoder" "nanocoder/node_modules/.bin/nanocoder"
 create_proxy "goose" "goose/bin/goose"
 create_proxy "qwen" "qwen-code/node_modules/@qwen-code/qwen-code/cli.js"
 create_proxy "agy"  "antigravity-cli/home/.local/bin/agy"
+create_proxy "grok" "grok-build/home/.grok/bin/grok"
+create_proxy "kimi" "kimi-code/home/.kimi-code/bin/kimi"
 
-log_ok "Agent proxies established (gemini, copilot, claude, opencode, kilo, pi, codex, droid, nanocoder, goose, qwen, agy)."
+log_ok "Agent proxies established (gemini, copilot, claude, opencode, kilo, pi, codex, droid, nanocoder, goose, qwen, agy, grok, kimi)."
 
 # --- 6. Docker Tool Wrappers ---
 # Tools that require Docker containers. The wrapper either proxies to the container
@@ -334,9 +342,10 @@ log_step "Docker tool wrappers..."
 create_docker_proxy() {
     local cmd=$1 image=$2 docker_cmd=$3 description=$4
     local wrapper="$BIN_DEST/$cmd"
+    local wrapper_tmp="$wrapper.tmp.$$"
     local log_file="/tmp/unraid-aicliagents/debug.log"
 
-    cat > "$wrapper" <<'DOCKEREOF'
+    cat > "$wrapper_tmp" <<'DOCKEREOF'
 #!/bin/bash
 # AICliAgents Docker Proxy: __CMD__
 CMD="__CMD__"
@@ -370,12 +379,13 @@ exec docker run --rm -v "$(pwd)":/src -w /src "$IMAGE" $DOCKER_CMD "$@"
 DOCKEREOF
 
     # Replace placeholders with actual values
-    sed -i "s|__CMD__|${cmd}|g" "$wrapper"
-    sed -i "s|__IMAGE__|${image}|g" "$wrapper"
-    sed -i "s|__DOCKER_CMD__|${docker_cmd}|g" "$wrapper"
-    sed -i "s|__DESCRIPTION__|${description}|g" "$wrapper"
+    sed -i "s|__CMD__|${cmd}|g" "$wrapper_tmp"
+    sed -i "s|__IMAGE__|${image}|g" "$wrapper_tmp"
+    sed -i "s|__DOCKER_CMD__|${docker_cmd}|g" "$wrapper_tmp"
+    sed -i "s|__DESCRIPTION__|${description}|g" "$wrapper_tmp"
 
-    chmod +x "$wrapper"
+    chmod +x "$wrapper_tmp"
+    mv -f "$wrapper_tmp" "$wrapper"
     ln -sf "$wrapper" "/usr/local/bin/$cmd"
 }
 

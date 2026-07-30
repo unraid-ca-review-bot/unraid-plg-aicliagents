@@ -16,6 +16,12 @@
 #
 # GENERATED from the trio by gen_storage_ops.py, then curated. Re-run the L3.5
 # suite after any edit to an op body.
+#
+# @internal Storage-component internal (Epic #1310). op_mount / op_bake /
+# op_consolidate / op_release + the manifest-writer php -r snippets (under the
+# bake/consolidate locks) are PRIVATE to the storage component — reached only via
+# the storagectl seam behind the FileStorage facade. No consumer shells these
+# directly (RegressionGuardsTest enforces it).
 
 _SO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 [ -d "$_SO_DIR" ] || _SO_DIR="/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/storage"
@@ -58,12 +64,12 @@ source "$_SO_DIR/resolve_paths.sh" 2>/dev/null || true
 source "$_SO_DIR/boot_integrity.sh" 2>/dev/null || true
 
 log() {
-    local msg="[$(get_ts)] [INFO] [MOUNT] $1"
+    local msg="[$(get_ts)] [INFO] [MOUNT] $(_trace_tag)$1"
     echo "$msg"
     echo "$msg" >> "$DEBUG_LOG"
 }
 error() {
-    local msg="[$(get_ts)] [ERR!] [MOUNT] $1"
+    local msg="[$(get_ts)] [ERR!] [MOUNT] $(_trace_tag)$1"
     echo "$msg"
     echo "$msg" >> "$DEBUG_LOG"
 }
@@ -75,6 +81,25 @@ fi
 
 # Validate persistence path
 guard_path "$PERSIST_PATH" "PERSIST_PATH" || { error "Persistence path failed validation: $PERSIST_PATH"; exit 1; }
+
+# S-02 (#1352): late-mount defer. A persist path under /mnt/ whose backing mount
+# is ABSENT (findmnt resolves the path to the rootfs "/" — the dir exists but the
+# pool / Unassigned Device behind it is not mounted yet; UD mounts can land up to
+# ~2 min after `started`) is a TRANSIENT condition, not a hard failure: defer
+# (exit 2, reason=target_not_mounted) so the caller retries, instead of the old
+# hard exit-1 from the durable-fstype check below. Scoped to /mnt/* only so
+# /boot and the /tmp itest persist roots are untouched.
+case "$PERSIST_PATH" in
+    /mnt/*)
+        _PERSIST_MNT_TGT="$(findmnt --noheadings --output TARGET --target "$PERSIST_PATH" 2>/dev/null || echo '')"
+        if [ "$_PERSIST_MNT_TGT" = "/" ]; then
+            error "Persistence path $PERSIST_PATH has no backing mount yet (resolves to rootfs) — deferring; is the device/pool mounted?"
+            _op_defer "$TYPE" "$ID" "mount_stack" "mount_stack_target_not_mounted" "target_not_mounted" \
+                "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"persist_path\":\"$PERSIST_PATH\"}"
+        fi
+        ;;
+esac
+
 _assert_persist_durable "$PERSIST_PATH" || { error "Persistence path is on a non-durable filesystem — mount refused"; exit 1; }
 
 # 1. Detect persistence fstype and derive upper-layer location (#342: auto-detect).
@@ -146,57 +171,64 @@ done
 
 # 4. Mount OverlayFS
 if [ -z "$LOWERS" ]; then
-    # Fresh entity or migration failed. 
-    # D-298: If a legacy image or folder still exists, it means migration hasn't finished or failed.
-    # We should NOT mount an empty stack in this case.
-    LEGACY_FOUND=0
-    [ -f "$PERSIST_PATH/aicli-agents.img" ] && LEGACY_FOUND=1
-    [ -f "$PERSIST_PATH/persistence/home_$ID.img" ] && LEGACY_FOUND=1
-    [ -f "$PERSIST_PATH/home_$ID.img" ] && LEGACY_FOUND=1
-    
-    # D-342: Check for raw legacy folders to prevent mounting an empty OverlayFS over unmigrated data
-    if [ "$TYPE" == "home" ]; then
-        [ -d "$PERSIST_PATH/persistence/$ID" ] && LEGACY_FOUND=1
-        [ -d "$PERSIST_PATH/$ID" ] && LEGACY_FOUND=1
-    fi
-
-    if [ $LEGACY_FOUND -eq 1 ]; then
-        error "No SquashFS layers found but legacy data (IMG/Folder) exists. Migration pending or failed."
-        exit 1
-    fi
+    # Fresh entity or migration failed.
+    # Follow-on 1b: the standalone LEGACY_FOUND probe (D-298 *.img / D-342 raw
+    # folders) that used to live here is FOLDED INTO boot_integrity_classify — the
+    # single owner of "is it safe to mount an empty stack here?". The classifier now
+    # returns legacy_unmanaged for the legacy-data case below (strict-halt arm), with
+    # a halt marker + recovery card — strictly better than the bare exit 1 here.
 
     # Phase 4a/4b: classify the empty-glob case before proceeding.
-    # In strict mode (boot_integrity_strict=1) halt on non-healthy states.
-    # In warn mode (boot_integrity_strict=0) log and proceed (Phase 4a behaviour).
-    _INTEGRITY_STATE="genuine_fresh"
+    # F7 (WP#1329): the default is now fail-closed 'unknown', NOT 'genuine_fresh' —
+    # if the classifier is undefined (boot_integrity.sh failed to source) or errors,
+    # we have NOT certified that this empty persist dir is genuinely fresh, so we must
+    # not mount an empty stack over data we couldn't inspect. genuine_fresh is reached
+    # ONLY when the classifier explicitly says so.
+    _INTEGRITY_STATE="unknown"
     if type boot_integrity_classify >/dev/null 2>&1; then
-        _INTEGRITY_STATE="$(boot_integrity_classify "$TYPE" "$ID" 2>/dev/null || echo 'unknown')"
+        # Pass the exact persist dir op_mount is operating on (Follow-on 1b) so the
+        # classifier's legacy-data + active-layer verdict matches this mount.
+        _INTEGRITY_STATE="$(boot_integrity_classify "$TYPE" "$ID" "$PERSIST_PATH" 2>/dev/null || echo 'unknown')"
     fi
 
-    # Read strict mode from config (default 1).
-    _BOOT_INTEGRITY_STRICT="$(_rp_read_cfg "boot_integrity_strict" 2>/dev/null)"
+    # Read strict mode from config (default 1). AICLI_ITEST_STRICT overrides it for the
+    # L3.5 harness (parallel-safe — no shared-cfg mutation), mirroring AICLI_ITEST_BACKEND.
+    _BOOT_INTEGRITY_STRICT="${AICLI_ITEST_STRICT:-$(_rp_read_cfg "boot_integrity_strict" 2>/dev/null)}"
     _BOOT_INTEGRITY_STRICT="${_BOOT_INTEGRITY_STRICT:-1}"
+
+    # _mount_integrity_halt <state> — write the halt marker (atomic temp+rename, so a
+    # concurrent multi-tab halt cannot leave a partial file), log the critical
+    # lifecycle event, surface the error, and exit 1. op_mount runs in a ( ) subshell,
+    # so this exits op_mount with the halt code. ONE place for the halt mechanics.
+    _mount_integrity_halt() {
+        local _state="$1"
+        local _halt_parent="/tmp/unraid-aicliagents/supervisor/halts/${TYPE}"
+        mkdir -p "$_halt_parent" 2>/dev/null
+        printf '%s' "$_state" > "${_halt_parent}/${ID}.tmp.$$" && mv "${_halt_parent}/${ID}.tmp.$$" "${_halt_parent}/${ID}"
+        lifecycle_log "critical" "mount_stack" "mount_stack_halted" \
+            "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"state\":\"$_state\"}" 2>/dev/null || true
+        error "Boot integrity: ${_state} for ${TYPE}/${ID}. Mount halted. Open Settings > Storage to recover."
+        exit 1
+    }
 
     case "$_INTEGRITY_STATE" in
         healthy|genuine_fresh)
             log "No lower layers found for ${TYPE} ${ID}. Mounting empty stack (state: ${_INTEGRITY_STATE})."
             ;;
-        legacy_unmanaged|path_drift|partial_loss|total_loss|corrupt_layers|host_mismatch)
+        legacy_unmanaged|total_loss)
+            # F7 (WP#1329): these NEVER mount an empty stack over real data — halt
+            # UNCONDITIONALLY, regardless of strict mode. legacy_unmanaged = unmigrated
+            # data present (the sibling/backup recovery net); total_loss = the manifest
+            # expected layers but none are on disk. Mounting empty here permanently
+            # shadows the data (the first bake captures the empty overlay), so strict
+            # mode must NOT be able to turn this protection off. "No protection removed."
+            _mount_integrity_halt "$_INTEGRITY_STATE"
+            ;;
+        path_drift|partial_loss|corrupt_layers|host_mismatch)
+            # Strict-gated: halt in strict mode, warn-and-proceed otherwise (Phase 4a).
             if [ "$_BOOT_INTEGRITY_STRICT" = "1" ]; then
-                # Write the halt marker (state-only file) so the supervisor and UI pick it up.
-                # Atomic temp+rename — concurrent halts (multi-tab triggers) cannot leave a partial file.
-                _HALT_PARENT="/tmp/unraid-aicliagents/supervisor/halts/${TYPE}"
-                mkdir -p "$_HALT_PARENT" 2>/dev/null
-                printf '%s' "$_INTEGRITY_STATE" > "${_HALT_PARENT}/${ID}.tmp.$$" && mv "${_HALT_PARENT}/${ID}.tmp.$$" "${_HALT_PARENT}/${ID}"
-
-                lifecycle_log "critical" "mount_stack" "mount_stack_halted" \
-                    "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"state\":\"$_INTEGRITY_STATE\"}" \
-                    2>/dev/null || true
-
-                error "Boot integrity: ${_INTEGRITY_STATE} for ${TYPE}/${ID}. Strict mode active -- mount halted. Open Settings > Storage to recover."
-                exit 1
+                _mount_integrity_halt "$_INTEGRITY_STATE"
             fi
-            # Strict disabled: warn and proceed (Phase 4a behaviour).
             error "Boot integrity: ${_INTEGRITY_STATE} for ${TYPE}/${ID}. Mounting empty stack in warn mode (strict disabled)."
             ;;
         untracked)
@@ -204,15 +236,11 @@ if [ -z "$LOWERS" ]; then
             log "Boot integrity: ${_INTEGRITY_STATE} for ${TYPE}/${ID}. Supervisor will attempt recovery. Mounting empty stack."
             ;;
         *)
-            # Unknown classification -- conservative halt in strict mode.
-            if [ "$_BOOT_INTEGRITY_STRICT" = "1" ]; then
-                lifecycle_log "critical" "mount_stack" "mount_stack_halted_unknown" \
-                    "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"state\":\"$_INTEGRITY_STATE\"}" \
-                    2>/dev/null || true
-                error "Boot integrity: unknown state '${_INTEGRITY_STATE}' for ${TYPE}/${ID}. Strict mode active -- halting."
-                exit 1
-            fi
-            log "Boot integrity: ${_INTEGRITY_STATE} for ${TYPE}/${ID}. Mounting empty stack."
+            # F7 (WP#1329): unknown = the classifier was unavailable or errored (the
+            # fail-closed default + the `|| echo unknown` on the call). Empty-mount
+            # safety CANNOT be certified, so FAIL CLOSED and halt regardless of strict —
+            # never silently mount empty over data we couldn't inspect.
+            _mount_integrity_halt "$_INTEGRITY_STATE"
             ;;
     esac
 
@@ -238,18 +266,46 @@ if [ -n "${_MOUNT_OP_LOCK_FD:-}" ]; then
     flock -w 30 "$_MOUNT_OP_LOCK_FD" || log "mount-op lock wait timed out after 30s — proceeding (possible wedged holder)"
 fi
 
-# Unmount if already mounted (defensive).
-# Try synchronous umount first so upperdir is fully released before the new
-# mount claims it. Sharing upperdir between two overlay mounts simultaneously
-# causes kernel "undefined behavior" (broken readdir, failed copy-up). Lazy
-# umount (-l) is kept as a fallback only when files are still open.
-if mountpoint -q "$MNT_POINT"; then
-    umount "$MNT_POINT" 2>/dev/null || umount -l "$MNT_POINT" || true
+# WP #1309: teardown-before-remount via the busy-arbiter (common.sh), SAFE BY
+# CONSTRUCTION. The old code did `umount … || umount -l … || true` then re-bound
+# the SAME upperdir/workdir — a lazy umount only detaches from the namespace and
+# defers releasing upper/work, so the fresh overlay double-binds the same upper →
+# copy-up poison (new-file create → ENOENT). The arbiter does a REAL umount only;
+# on a BUSY mount it DEFERS (keep the live overlay — the upper holds all data,
+# only the lower refresh waits for idle) or, for a phantom-and-busy mount, errors
+# rather than perform an unsafe remount. The L-mount flock taken above (#1263)
+# is still held across this decision.
+# `if …; then` so op_mount's `set -e` does NOT fire on the arbiter's non-zero
+# (defer/error) return before we capture it — a bare call would exit the subshell
+# with the arbiter's code and SKIP the defer-reason marker + lifecycle event below.
+if _mount_teardown_arbiter "$MNT_POINT"; then
+    _TEARDOWN_RC=0
+else
+    _TEARDOWN_RC=$?
 fi
+if [ "$_TEARDOWN_RC" -eq 2 ]; then
+    log "Mount $MNT_POINT is BUSY (live overlay). Deferring lower refresh — upper holds all data; the new lower is picked up on the next idle refresh."
+    _op_defer "$TYPE" "$ID" "mount_stack" "mount_stack_refresh_deferred_busy" "mount_busy" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"mount_point\":\"$MNT_POINT\"}"
+elif [ "$_TEARDOWN_RC" -eq 1 ]; then
+    error "Mount $MNT_POINT is busy and NOT a healthy overlay — refusing unsafe remount (would poison copy-up)."
+    lifecycle_log "error" "mount_stack" "mount_stack_busy_phantom" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"mount_point\":\"$MNT_POINT\"}" 2>/dev/null || true
+    exit 1
+fi
+# _TEARDOWN_RC == 0: released, or was never mounted — safe to bind a fresh overlay.
 
 LAYER_COUNT=$(echo "$LOWERS" | tr ':' '\n' | wc -l)
-if mount -t overlay overlay -o lowerdir="$LOWERS",upperdir="$UPPER_DIR",workdir="$WORK_DIR" "$MNT_POINT"; then
+# Claude Code and other package managers finalize directory caches with rename(2).
+# A directory originating in a SquashFS lower otherwise returns EXDEV; redirect_dir
+# copies up its metadata and preserves the atomic rename contract.
+if mount -t overlay overlay -o lowerdir="$LOWERS",upperdir="$UPPER_DIR",workdir="$WORK_DIR",redirect_dir=on "$MNT_POINT"; then
     log "Stack mounted at $MNT_POINT (Layers: $LAYER_COUNT)"
+    # Any prior busy snapshot is now part of this freshly assembled lower stack
+    # and must never be considered replaceable by a later live-session bake.
+    if [ "$TYPE" = "home" ]; then
+        _MOUNT_LOCK_ID="${ID//[^a-zA-Z0-9_-]/_}"
+        rm -f "/tmp/unraid-aicliagents/.bake_busy_snapshot_${TYPE}_${_MOUNT_LOCK_ID}" 2>/dev/null || true
+    fi
     lifecycle_log "info" "mount_stack" "mount_stack_assembled" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"layer_count\":$LAYER_COUNT,\"mount_point\":\"$MNT_POINT\"}" 2>/dev/null || true
 else
     error "Failed to mount OverlayFS stack at $MNT_POINT"
@@ -284,6 +340,9 @@ install_failure_trap "$TYPE" "$ID" "commit_stack"
 # Source canonical path resolver and lifecycle log writer (Phase 1)
 source "$_SO_DIR/resolve_paths.sh" 2>/dev/null || true
 
+# F6 (WP#1331): the SINGLE manifest writer (replaces the inline php -r addLayer copy).
+source "$_SO_DIR/manifest_write.sh" 2>/dev/null || true
+
 # Source atomic layer writer (Phase 2)
 source "$_SO_DIR/atomic_write_layer.sh" 2>/dev/null || {
     error "atomic_write_layer.sh missing — cannot bake safely"
@@ -301,6 +360,8 @@ _entity_paths "$TYPE" "$ID" "$PERSIST_PATH"   # sets UPPER_DIR/WORK_DIR/MNT_POIN
 # Sanitise $ID to keep the lock filename shell-safe (alphanumeric + hyphen).
 _LOCK_ID="${ID//[^a-zA-Z0-9_-]/_}"
 _BAKE_LOCK="/var/run/aicli-bake-${TYPE}-${_LOCK_ID}.lock"
+_BUSY_SNAPSHOT_MARKER="/tmp/unraid-aicliagents/.bake_busy_snapshot_${TYPE}_${_LOCK_ID}"
+_HOME_BUSY_AT_BAKE_START=0
 exec 9>"$_BAKE_LOCK"
 if ! flock -n 9; then
     # Another bake for this entity is already running.  The in-progress bake
@@ -330,12 +391,12 @@ _BAKE_MANIFEST="/tmp/unraid-aicliagents/.bake_manifest_${TYPE}_${_LOCK_ID}"
 rm -f "$_BAKE_MANIFEST" "${_BAKE_MANIFEST}.abs" 2>/dev/null || true
 
 log() {
-    local msg="[$(get_ts)] [INFO] [COMMIT] $1"
+    local msg="[$(get_ts)] [INFO] [COMMIT] $(_trace_tag)$1"
     echo "$msg"
     echo "$msg" >> "$DEBUG_LOG"
 }
 error() {
-    local msg="[$(get_ts)] [ERR!] [COMMIT] $1"
+    local msg="[$(get_ts)] [ERR!] [COMMIT] $(_trace_tag)$1"
     echo "$msg"
     echo "$msg" >> "$DEBUG_LOG"
 }
@@ -351,6 +412,10 @@ lifecycle_log "info" "commit_stack" "bash_bake_start" "{\"type\":\"$TYPE\",\"id\
 # between. Idle bakes are NEVER gated -- they reclaim and trim, clearing the
 # marker. Override via AICLI_BUSY_BAKE_COOLDOWN_SEC (tests / tuning).
 if [ "$TYPE" = "home" ] && home_mount_in_use "$MNT_POINT"; then
+    _HOME_BUSY_AT_BAKE_START=1
+    if ! _prepare_busy_snapshot_roll "$TYPE" "$ID" "$_BUSY_SNAPSHOT_MARKER"; then
+        log "Could not prepare rolling busy snapshot marker; this bake will retain every layer for safety"
+    fi
     _BUSY_COOLDOWN_SEC="${AICLI_BUSY_BAKE_COOLDOWN_SEC:-1800}"
     _COOLDOWN_MARKER="/tmp/unraid-aicliagents/.bake_busy_cooldown_${TYPE}_${_LOCK_ID}"
     _last_busy_bake=0
@@ -359,9 +424,7 @@ if [ "$TYPE" = "home" ] && home_mount_in_use "$MNT_POINT"; then
     _now_cd=$(date +%s)
     if [ $(( _now_cd - _last_busy_bake )) -lt "$_BUSY_COOLDOWN_SEC" ]; then
         log "Home busy and last persist within ${_BUSY_COOLDOWN_SEC}s cooldown — skipping redundant bake (data already persisted; reclaim deferred to idle)."
-        lifecycle_log "info" "commit_stack" "bash_bake_busy_cooldown" "{\"type\":\"$TYPE\",\"id\":\"$ID\"}" 2>/dev/null || true
-        write_defer_reason "$TYPE" "$ID" "busy_cooldown"
-        exit 2
+        _op_defer "$TYPE" "$ID" "commit_stack" "bash_bake_busy_cooldown" "busy_cooldown" "{\"type\":\"$TYPE\",\"id\":\"$ID\"}"
     fi
 fi
 
@@ -406,6 +469,17 @@ _assert_persist_durable "$PERSIST_PATH" || { error "Persistence path is on a non
 
 # Check disk space (need at least 100MB free for a delta)
 check_disk_space "$PERSIST_PATH/.diskcheck" 100 || { error "Insufficient disk space on $PERSIST_PATH"; exit 1; }
+
+# S-09 (#1352): FAT32 per-file cap preflight. On a vfat persist target (USB boot)
+# a single file caps at 4 GiB — if the projected delta (du of the upper) is within
+# 5% of the cap, mksquashfs would fail mid-write with a confusing error. Refuse
+# UP FRONT: exit 4 (precondition failed), marker fat32_size_cap, dynamix notify.
+# fstype comes from findmnt inside the check — never from a path prefix.
+if ! _fat32_cap_check "$PERSIST_PATH" "$UPPER_DIR"; then
+    error "Projected delta size (${_FAT32_PROJECTED_BYTES:-0} bytes) is within 5% of the FAT32 4 GiB per-file cap — refusing bake (precondition)."
+    _fat32_cap_refuse "$TYPE" "$ID" "commit_stack"
+    exit 4
+fi
 
 # Record a marker timestamp BEFORE baking. Any writes to the upper dir after this
 # point will not be in the delta and must NOT be flushed.
@@ -469,11 +543,11 @@ if [ "$SQLITE_DB_COUNT" -gt 0 ]; then
             exit 1
         fi
         log "SQLite backup deferred (DB locked or backup timeout) — exiting 2 to retry"
-        lifecycle_log "info" "commit_stack" "bash_bake_deferred" \
-            "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"sqlite_backup_failed\",\"db_count\":$SQLITE_DB_COUNT}" 2>/dev/null || true
-        # WP #1078: distinguish defer reasons for the UI (see TaskService.php).
-        write_defer_reason "$TYPE" "$ID" "sqlite_backup_deferred"
-        exit 2
+        # WP #1078: distinguish defer reasons for the UI (see TaskService.php). The
+        # lifecycle payload's reason ('sqlite_backup_failed') is the diagnostic; the
+        # marker reason ('sqlite_backup_deferred') is the UI key — keep both.
+        _op_defer "$TYPE" "$ID" "commit_stack" "bash_bake_deferred" "sqlite_backup_deferred" \
+            "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"sqlite_backup_failed\",\"db_count\":$SQLITE_DB_COUNT}"
     fi
 fi
 
@@ -517,6 +591,23 @@ fi
 # NEW_SQSH is the final path of the just-written layer
 NEW_SQSH="$PERSIST_PATH/$NEW_BASENAME"
 log "Bake complete: $NEW_BASENAME"
+
+# Epic #1310 Step 7: record the manifest entry HERE — in bash, while the fd9 bake
+# lock is still held — so the layer file and its manifest entry land together
+# (closes the PHP-records-AFTER-bash-released-the-lock drift window that the 7 s
+# reconcile loop + boot-integrity heuristics exist to patch). We record the EXACT
+# layer just written (not a glob-newest, which can race). Idempotent (addLayer
+# upserts by filename). F6 (WP#1331): this is the SOLE synchronous recorder — the PHP
+# commitChanges belt-and-braces path was removed in this epic — so the lifecycle event
+# is gated on the writer's SUCCESS (it no longer fires when the write failed) and the
+# supervisor reconcile is the only remaining backstop.
+_MANIFEST_RECORDED=0
+if manifest_record_layer "$TYPE" "$ID" "$PERSIST_PATH" "$NEW_BASENAME"; then
+    _MANIFEST_RECORDED=1
+    lifecycle_log "info" "commit_stack" "manifest_recorded_under_lock" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"sqsh\":\"$NEW_BASENAME\"}" 2>/dev/null || true
+else
+    lifecycle_log "warn" "commit_stack" "manifest_record_failed" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"sqsh\":\"$NEW_BASENAME\"}" 2>/dev/null || true
+fi
 
 # 3. Check if ZRAM can be safely flushed
 MNT_POINT="/usr/local/emhttp/plugins/unraid-aicliagents/agents/$ID"
@@ -562,20 +653,71 @@ if home_mount_in_use "$MNT_POINT"; then
     log "Mount is BUSY (open fd or live HOME=$MNT_POINT session). Deferring refresh + ZRAM cleanup."
     log "Data persisted to Flash. ZRAM dirty stats remain until sessions close."
     rm -f "$MARKER"
+    # While the same live mount remains busy, UPPER is never trimmed. Therefore
+    # this layer contains everything in the previous busy snapshot plus newer
+    # writes. Keep one rolling crash-recovery snapshot instead of consuming a
+    # layer slot on every scheduled bake. op_mount clears the marker before a
+    # snapshot can become part of a lower stack.
+    if [ "$TYPE" = "home" ] && [ "$_HOME_BUSY_AT_BAKE_START" -eq 1 ] \
+       && [ "$_MANIFEST_RECORDED" -eq 1 ]; then
+        _REPLACED_BUSY_SNAPSHOT=""
+        if _replace_busy_snapshot "$TYPE" "$ID" "$PERSIST_PATH" \
+                "$_BUSY_SNAPSHOT_MARKER" "$NEW_BASENAME"; then
+            if [ -n "$_REPLACED_BUSY_SNAPSHOT" ]; then
+                log "Replaced superseded busy snapshot $_REPLACED_BUSY_SNAPSHOT with $NEW_BASENAME"
+                lifecycle_log "info" "commit_stack" "busy_snapshot_replaced" \
+                    "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"previous\":\"$_REPLACED_BUSY_SNAPSHOT\",\"current\":\"$NEW_BASENAME\"}" 2>/dev/null || true
+            else
+                log "Recorded first rolling busy snapshot $NEW_BASENAME"
+            fi
+        else
+            _busy_roll_rc=$?
+            if [ "$_busy_roll_rc" -eq 2 ]; then
+                log "Mount stack changed during bake; keeping the new snapshot as a normal layer for safety"
+            else
+                log "Could not roll the busy snapshot; keeping every layer for safety"
+            fi
+        fi
+    fi
     # Stamp the busy-bake cooldown: while a session keeps the home busy, the
     # upper is never trimmed (reclaim deferred), so without this every bake
     # trigger would re-bake the whole untrimmed upper. The pre-bake gate near
     # the top skips redundant bakes until this cooldown elapses. (home only.)
     [ "$TYPE" = "home" ] && date +%s > "/tmp/unraid-aicliagents/.bake_busy_cooldown_${TYPE}_${_LOCK_ID}" 2>/dev/null || true
-    lifecycle_log "info" "commit_stack" "bash_bake_busy" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"sqsh\":\"$(basename "$NEW_SQSH")\",\"bytes\":$SQSH_BYTES}" 2>/dev/null || true
-    write_defer_reason "$TYPE" "$ID" "mount_busy"
-    exit 2
+    _op_defer "$TYPE" "$ID" "commit_stack" "bash_bake_busy" "mount_busy" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"sqsh\":\"$(basename "$NEW_SQSH")\",\"bytes\":$SQSH_BYTES}"
 fi
 
 # Refresh mount stack to pick up the new lower layer. Done BEFORE selective
 # cleanup so the new lower is exposed when we start removing files from upper.
 log "Refreshing mount stack..."
-op_mount "$TYPE" "$ID" "$PERSIST_PATH"
+# WP #1309: op_mount can now DEFER (exit 2) if the mount went busy in the race
+# between the home_mount_in_use check above and here (a session launched in the
+# gap). The bake already persisted to Flash, so deferring loses NO data — we must
+# only skip the selective ZRAM cleanup (never wipe the upper while the new lower
+# isn't yet exposed) and defer reclaim to the next idle tick, exactly as the
+# home_mount_in_use branch above does. `if op_mount; then` keeps `set -e` from
+# firing so we can capture the exit code.
+if op_mount "$TYPE" "$ID" "$PERSIST_PATH"; then
+    _REFRESH_RC=0
+else
+    _REFRESH_RC=$?
+fi
+if [ "$_REFRESH_RC" -ne 0 ]; then
+    rm -f "$MARKER"
+    if [ "$_REFRESH_RC" -eq 2 ]; then
+        log "Mount refresh deferred (busy) — data persisted to Flash; ZRAM reclaim deferred to idle."
+        # Stamp the busy-bake cooldown (home only) so the pre-bake gate skips
+        # redundant re-bakes of the still-untrimmed upper until idle.
+        [ "$TYPE" = "home" ] && date +%s > "/tmp/unraid-aicliagents/.bake_busy_cooldown_${TYPE}_${_LOCK_ID}" 2>/dev/null || true
+        _op_defer "$TYPE" "$ID" "commit_stack" "bash_bake_refresh_deferred" "mount_busy" \
+            "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"sqsh\":\"$(basename "$NEW_SQSH")\"}"
+    fi
+    # Hard failure (exit 1+): preserve the upper (skip reclaim) and surface it.
+    error "Post-bake mount refresh failed (rc=$_REFRESH_RC) — preserving upper, skipping reclaim."
+    lifecycle_log "error" "commit_stack" "bash_bake_refresh_failed" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"rc\":$_REFRESH_RC}" 2>/dev/null || true
+    exit "$_REFRESH_RC"
+fi
 
 # WP #935: Selective UPPER cleanup — now safe to run because the refresh above
 # exposed the new lower. Per-file: a file is wiped only if (a) its mtime is not
@@ -637,6 +779,9 @@ install_failure_trap "$TYPE" "$ID" "consolidate_layers"
 # Source canonical path resolver and lifecycle log writer (Phase 1)
 source "$_SO_DIR/resolve_paths.sh" 2>/dev/null || true
 
+# F6 (WP#1331): the SINGLE manifest writer (replaces the inline php -r replaceLayers).
+source "$_SO_DIR/manifest_write.sh" 2>/dev/null || true
+
 # Source atomic layer writer (Phase 2)
 source "$_SO_DIR/atomic_write_layer.sh" 2>/dev/null || {
     echo "[CONSOLIDATE] FATAL: atomic_write_layer.sh missing — cannot consolidate safely" >&2
@@ -650,12 +795,12 @@ TASK_STATUS_FILE="/tmp/unraid-aicliagents/task-status-$ID"
 _entity_paths "$TYPE" "$ID" "$PERSIST_PATH"   # sets UPPER_DIR/WORK_DIR/MNT_POINT/ENTITY_UPPER_MODE
 
 log() {
-    local msg="[$(get_ts)] [INFO] [CONSOLIDATE] $1"
+    local msg="[$(get_ts)] [INFO] [CONSOLIDATE] $(_trace_tag)$1"
     echo "$msg"
     echo "$msg" >> "$DEBUG_LOG"
 }
 error() {
-    local msg="[$(get_ts)] [ERR!] [CONSOLIDATE] $1"
+    local msg="[$(get_ts)] [ERR!] [CONSOLIDATE] $(_trace_tag)$1"
     echo "$msg"
     echo "$msg" >> "$DEBUG_LOG"
 }
@@ -693,11 +838,19 @@ update_task_status "Initializing..." 5 ""
 if ! mountpoint -q "$MNT_POINT"; then
     log "Stack not mounted. Attempting remount..."
     update_task_status "Mounting stack..." 10 ""
-    op_mount "$TYPE" "$ID" "$PERSIST_PATH" || {
-        error "Failed to mount stack for consolidation";
-        update_task_status "Failed" 0 "Mount failed";
-        exit 1;
-    }
+    # WP #1309: map op_mount's busy-defer (exit 2) to a consolidate defer, not a
+    # hard failure — a busy race is "retry when idle", never an error.
+    if op_mount "$TYPE" "$ID" "$PERSIST_PATH"; then :; else
+        _ensure_rc=$?
+        if [ "$_ensure_rc" -eq 2 ]; then
+            log "Mount busy during consolidation pre-mount — deferring (retry when idle)."
+            update_task_status "Deferred (mount busy)" 0 "Sessions active — will retry when idle"
+            _op_defer "$TYPE" "$ID" "consolidate_layers" "bash_consolidate_deferred" "mount_busy"
+        fi
+        error "Failed to mount stack for consolidation"
+        update_task_status "Failed" 0 "Mount failed"
+        exit 1
+    fi
 fi
 
 # WP #922: pre-bake busy check. Match commit_stack.sh's safety pattern — if any
@@ -714,14 +867,16 @@ fi
 #
 # Exit 2 signals "deferred / busy" — supervisor treats this as not-a-failure
 # and retries on next tick without incrementing the failure counter.
-if command -v fuser >/dev/null 2>&1; then
-    if fuser -sm "$MNT_POINT" 2>/dev/null; then
-        log "Mount is BUSY (open files detected by fuser -sm). Deferring consolidation — will retry when idle."
-        lifecycle_log "info" "consolidate_layers" "bash_consolidate_deferred" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"mount_busy\"}" 2>/dev/null || true
-        update_task_status "Deferred (mount busy)" 0 "Sessions active — will retry when idle"
-        write_defer_reason "$TYPE" "$ID" "mount_busy"
-        exit 2
-    fi
+# Epic #1310 / ADR finding #2: use the SESSION-AWARE busy-arbiter, NOT a bare
+# `fuser -sm`. A bare fuser only sees open fds/cwd/mmap on the mount and MISSES a
+# live interactive session — a ttyd carrying AICLI_HOME=<mount> holds no fd, so
+# fuser reads "idle" and consolidate would umount/remount the overlay out from
+# under the session. home_mount_in_use (the same arbiter op_bake's reclaim uses)
+# combines the fuser fast-path with the ttyd-session scan, so it defers correctly.
+if home_mount_in_use "$MNT_POINT"; then
+    log "Mount is BUSY (open fd or live session on $MNT_POINT). Deferring consolidation — will retry when idle."
+    update_task_status "Deferred (mount busy)" 0 "Sessions active — will retry when idle"
+    _op_defer "$TYPE" "$ID" "consolidate_layers" "bash_consolidate_deferred" "mount_busy"
 fi
 
 # WP #1246: refresh the mount before reading the merged view for consolidation.
@@ -733,11 +888,18 @@ fi
 # mount), so refreshing here guarantees consolidate reads a COMPLETE view. Safe:
 # the fuser idle-check just above confirmed no open fds, so the umount-remount is
 # clean (the same precondition op_bake's post-bake refresh relies on).
-op_mount "$TYPE" "$ID" "$PERSIST_PATH" || {
+# WP #1309: a busy-defer (exit 2) here is "retry when idle", not a hard failure.
+if op_mount "$TYPE" "$ID" "$PERSIST_PATH"; then :; else
+    _refresh_rc=$?
+    if [ "$_refresh_rc" -eq 2 ]; then
+        log "WP #1246 pre-consolidate refresh deferred (mount busy) — retry when idle."
+        update_task_status "Deferred (mount busy)" 0 "Sessions active — will retry when idle"
+        _op_defer "$TYPE" "$ID" "consolidate_layers" "bash_consolidate_deferred" "mount_busy"
+    fi
     error "WP #1246: pre-consolidate mount refresh failed — aborting rather than bake a stale view."
     update_task_status "Failed" 0 "Mount refresh failed"
     exit 1
-}
+fi
 
 # WP #1278 (#3): lowerdir-completeness backstop. The refresh above re-discovers
 # ALL on-disk layers and mounts them all-or-nothing, so in normal operation the
@@ -760,10 +922,8 @@ case "$_MOUNTED_COUNT" in ''|*[!0-9]*) _MOUNTED_COUNT=0 ;; esac
 if [ "$_DISCOVERED_COUNT" -ge 1 ] && [ "$_MOUNTED_COUNT" -ne "$_DISCOVERED_COUNT" ]; then
     error "WP #1278: mounted lowerdir count ($_MOUNTED_COUNT) != on-disk layer count ($_DISCOVERED_COUNT) after refresh — refusing to consolidate from an incomplete view (would risk deleting un-captured deltas). Deferring."
     update_task_status "Deferred" 0 "Incomplete mount — retry when stack is complete"
-    lifecycle_log "warn" "consolidate_layers" "bash_consolidate_deferred" \
-        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"lowerdir_incomplete\",\"mounted\":$_MOUNTED_COUNT,\"discovered\":$_DISCOVERED_COUNT}" 2>/dev/null || true
-    write_defer_reason "$TYPE" "$ID" "consolidate_lowerdir_incomplete"
-    exit 2
+    _op_defer "$TYPE" "$ID" "consolidate_layers" "bash_consolidate_deferred" "consolidate_lowerdir_incomplete" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"lowerdir_incomplete\",\"mounted\":$_MOUNTED_COUNT,\"discovered\":$_DISCOVERED_COUNT}" "warn"
 fi
 
 # 2. Preparation: Pruning
@@ -884,6 +1044,20 @@ check_disk_space "$PERSIST_PATH/.diskcheck" 200 || {
     exit 1
 }
 
+# S-09 (#1352): FAT32 per-file cap preflight (consolidate projects from the MERGED
+# view, since the consolidated layer captures the whole home). vfat-only, fstype
+# from findmnt — never path-derived. Within 5% of the 4 GiB cap → exit 4
+# (precondition failed) + fat32_size_cap marker + dynamix notify, BEFORE the
+# (expensive) mksquashfs and before anything destructive. The post-bake 3.9 GB
+# size check further down stays as the belt-and-braces backstop.
+if ! _fat32_cap_check "$PERSIST_PATH" "$MNT_POINT"; then
+    error "Projected consolidated size (${_FAT32_PROJECTED_BYTES:-0} bytes) is within 5% of the FAT32 4 GiB per-file cap — refusing consolidate (precondition)."
+    update_task_status "Failed" 0 "Exceeds FAT32 file size limit"
+    rm -f "$CONSOLIDATE_MARKER"
+    _fat32_cap_refuse "$TYPE" "$ID" "consolidate_layers"
+    exit 4
+fi
+
 # WP #935: detect SQLite DBs in the merged view and back them up via Online
 # Backup API before the bake.
 # WP #1078 (2026-05-24): the bake now uses overlay-merge (lower=MNT_POINT,
@@ -923,10 +1097,8 @@ if [ "$SQLITE_DB_COUNT" -gt 0 ]; then
         fi
         log "SQLite backup deferred (DB locked or backup timeout) — exiting 2 to retry"
         update_task_status "Deferred" 0 "SQLite DB locked — retry later"
-        lifecycle_log "info" "consolidate_layers" "bash_consolidate_deferred" \
-            "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"sqlite_backup_failed\",\"db_count\":$SQLITE_DB_COUNT}" 2>/dev/null || true
-        write_defer_reason "$TYPE" "$ID" "sqlite_backup_deferred"
-        exit 2
+        _op_defer "$TYPE" "$ID" "consolidate_layers" "bash_consolidate_deferred" "sqlite_backup_deferred" \
+            "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"sqlite_backup_failed\",\"db_count\":$SQLITE_DB_COUNT}"
     fi
 fi
 
@@ -1002,10 +1174,7 @@ if ! flock -n 8; then
     rm -f "$PERSIST_PATH/$FINAL_NAME" 2>/dev/null
     rm -f "$CONSOLIDATE_MARKER"
     update_task_status "Deferred" 0 "Bake in progress — retry later"
-    lifecycle_log "info" "consolidate_layers" "bash_consolidate_deferred" \
-        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"bake_lock_held\"}" 2>/dev/null || true
-    write_defer_reason "$TYPE" "$ID" "bake_lock_held"
-    exit 2
+    _op_defer "$TYPE" "$ID" "consolidate_layers" "bash_consolidate_deferred" "bake_lock_held"
 fi
 
 # Re-validate: did a bake land a NEW delta since OLD_LAYERS was snapshotted
@@ -1027,10 +1196,8 @@ for _cur in "${_CURRENT_LAYERS[@]}"; do
         rm -f "$PERSIST_PATH/$FINAL_NAME" 2>/dev/null
         rm -f "$CONSOLIDATE_MARKER"
         update_task_status "Deferred" 0 "A bake completed during consolidation — retry later"
-        lifecycle_log "info" "consolidate_layers" "bash_consolidate_deferred" \
-            "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"bake_landed_during_consolidate\",\"new_layer\":\"$_cur_base\"}" 2>/dev/null || true
-        write_defer_reason "$TYPE" "$ID" "bake_landed_during_consolidate"
-        exit 2
+        _op_defer "$TYPE" "$ID" "consolidate_layers" "bash_consolidate_deferred" "bake_landed_during_consolidate" \
+            "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"reason\":\"bake_landed_during_consolidate\",\"new_layer\":\"$_cur_base\"}"
     fi
 done
 # Lock held on fd 8 + layer set validated — safe to swap the manifest and
@@ -1049,28 +1216,16 @@ done
 # The manifest is written atomically (tmp+fsync+rename inside LayerManifestService::replaceLayers).
 log "Updating manifest to list only the new consolidated layer (before file deletes)..."
 update_task_status "Updating manifest..." 85 ""
-ENTITY="${TYPE}/${ID}"
-NOW_TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%SZ')
-SQSH_SHA256=$(sha256sum "$PERSIST_PATH/$FINAL_NAME" 2>/dev/null | awk '{print $1}' || echo "")
-SQSH_BYTES=$(stat -c '%s' "$PERSIST_PATH/$FINAL_NAME" 2>/dev/null || echo 0)
-if command -v php >/dev/null 2>&1; then
-    php -d display_errors=0 -r "
-        \$_SERVER['DOCUMENT_ROOT']='/usr/local/emhttp';
-        require_once '/usr/local/emhttp/plugins/unraid-aicliagents/src/includes/AICliAgentsManager.php';
-        \AICliAgents\Services\LayerManifestService::replaceLayers('$ENTITY', [
-            [
-                'filename'   => '$FINAL_NAME',
-                'sha256'     => '$SQSH_SHA256',
-                'bytes'      => (int)'$SQSH_BYTES',
-                'kind'       => 'consolidated',
-                'created_at' => '$NOW_TS',
-            ],
-        ], '$PERSIST_PATH');
-    " 2>/dev/null || true
+# F6 (WP#1331): the SINGLE manifest writer (sha256/bytes/kind computed PHP-side).
+if manifest_replace_layers "$TYPE" "$ID" "$PERSIST_PATH" "$FINAL_NAME"; then
     lifecycle_log "info" "consolidate_layers" "manifest_updated_before_delete" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"final\":\"$FINAL_NAME\"}" 2>/dev/null || true
 else
-    log "WARNING: php not available — manifest not updated before old-layer delete. Reconcile will recover."
+    log "WARNING: manifest not updated before old-layer delete (php missing or write failed). Reconcile will recover."
 fi
+
+# L3.5 (Follow-on 4): deterministic SIGKILL window — manifest replaced to
+# [consolidated], NO intent yet, old layers still on disk.
+_itest_sigkill_window "after_manifest_replace"
 
 # 4b. Delete old layer files — now safe because manifest no longer references them.
 #     If SIGTERM fires here, the old files are untracked (reconcile recovers),
@@ -1078,6 +1233,23 @@ fi
 log "Cleaning up old layers..."
 update_task_status "Cleaning up old layers..." 90 ""
 guard_path "$PERSIST_PATH" "PERSIST_PATH (cleanup)" || { error "Path guard failed before cleanup"; exit 1; }
+
+# Epic #1310 #1320: write a write-ahead INTENT before the destructive delete, so
+# an interrupted consolidate is unambiguous — the listed deletes are INTENTIONAL
+# prunes (the kept consolidated layer holds their data), never real loss. Cleared
+# once the deletes complete. (write_intent/clear_intent from common.sh.)
+_INTENT_DEL=""
+for _ol in "${OLD_LAYERS[@]}"; do
+    _olb="$(basename "$_ol")"
+    [ "$_olb" = "$FINAL_NAME" ] && continue
+    [ -n "$_INTENT_DEL" ] && _INTENT_DEL="$_INTENT_DEL,"
+    _INTENT_DEL="$_INTENT_DEL\"$_olb\""
+done
+write_intent "$PERSIST_PATH" "$TYPE" "$ID" "{\"op\":\"consolidate\",\"keep\":\"$FINAL_NAME\",\"delete\":[$_INTENT_DEL]}"
+
+# L3.5 (Follow-on 4): intent written, deletes not yet started.
+_itest_sigkill_window "after_intent"
+
 for old_layer in "${OLD_LAYERS[@]}"; do
     [ -f "$old_layer" ] || continue
     # Belt-and-braces: never delete the new consolidated file
@@ -1085,7 +1257,14 @@ for old_layer in "${OLD_LAYERS[@]}"; do
     rm -f "$old_layer"
     lifecycle_log "info" "consolidate_layers" "old_layer_removed" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"file\":\"$(basename "$old_layer")\"}" 2>/dev/null || true
     log "Removed old layer: $(basename "$old_layer")"
+    # L3.5 (Follow-on 4): mid-delete — at least one old layer pruned, intent present,
+    # others still on disk. (With >=2 old layers the kill lands here.)
+    _itest_sigkill_window "mid_delete"
 done
+# L3.5 (Follow-on 4): all deletes done, intent still present (stale).
+_itest_sigkill_window "after_delete"
+# Deletes complete — the consolidated layer is the sole authority now; clear the intent.
+clear_intent "$PERSIST_PATH" "$TYPE" "$ID"
 
 # 6. Remount & Clear RAM
 # WP #1080 + #1081 (2026-05-24): single fuser check, then check UPPER_CHANGED
@@ -1098,8 +1277,8 @@ done
 # Why check UPPER_CHANGED before umount: `find $UPPER_DIR -newer $marker`
 # operates on the raw ZRAM tmpfs upper, not through the overlay mount.
 # Doing the check before umount means we don't add to the unmounted window.
-if fuser -sm "$MNT_POINT" 2>/dev/null; then
-    log "Mount became BUSY during consolidate (agent launched mid-bake). Deferring refresh+wipe — next mount cycle picks up $FINAL_NAME."
+if home_mount_in_use "$MNT_POINT"; then
+    log "Mount became BUSY during consolidate (agent launched / live session). Deferring refresh+wipe — next mount cycle picks up $FINAL_NAME."
     rm -f "$CONSOLIDATE_MARKER"
     FINAL_BYTES=$(stat -c '%s' "$PERSIST_PATH/$FINAL_NAME" 2>/dev/null || echo 0)
     lifecycle_log "info" "consolidate_layers" "bash_consolidate_ok_refresh_deferred" \
@@ -1125,7 +1304,26 @@ update_task_status "Finalizing stack..." 95 ""
 # Refresh mount FIRST (mount_stack.sh handles its own umount-then-mount cycle —
 # the brief umount window inside it is the only unmounted gap, vs the prior
 # code's umount + wipe + mount which kept it down for the full wipe).
-op_mount "$TYPE" "$ID" "$PERSIST_PATH"
+# WP #1309: capture the exit. If the mount went busy (or phantom) in the race
+# after the fuser idle-check above, op_mount DEFERS (exit 2) instead of an
+# unsafe lazy-remount. The consolidate itself already SUCCEEDED durably
+# (manifest swapped, old layers removed, consolidated layer on Flash) — so on
+# ANY non-zero refresh we preserve the upper, SKIP the wipe, and finish clean;
+# the next idle mount cycle picks up the new lower and a later bake reclaims the
+# upper. (Mirrors the "mount became busy" branch just above.)
+if op_mount "$TYPE" "$ID" "$PERSIST_PATH"; then
+    _FINAL_REFRESH_RC=0
+else
+    _FINAL_REFRESH_RC=$?
+fi
+if [ "$_FINAL_REFRESH_RC" -ne 0 ]; then
+    log "Post-consolidate mount refresh deferred (rc=$_FINAL_REFRESH_RC) — consolidation complete; upper preserved, reclaim deferred to idle."
+    FINAL_BYTES=$(stat -c '%s' "$PERSIST_PATH/$FINAL_NAME" 2>/dev/null || echo 0)
+    lifecycle_log "info" "consolidate_layers" "bash_consolidate_ok_refresh_deferred" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"final\":\"$FINAL_NAME\",\"bytes\":$FINAL_BYTES,\"reason\":\"refresh_deferred_rc${_FINAL_REFRESH_RC}\"}" 2>/dev/null || true
+    update_task_status "Consolidation complete (mount refresh deferred — sessions active)." 100 ""
+    exit 0
+fi
 
 # Now safely wipe UPPER (if appropriate). The new consolidated lower is exposed
 # via the just-refreshed mount, so removing files from upper falls through to
@@ -1146,4 +1344,311 @@ fi
 FINAL_BYTES=$(stat -c '%s' "$PERSIST_PATH/$FINAL_NAME" 2>/dev/null || echo 0)
 lifecycle_log "info" "consolidate_layers" "bash_consolidate_ok" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"final\":\"$FINAL_NAME\",\"bytes\":$FINAL_BYTES}" 2>/dev/null || true
 update_task_status "Consolidation complete." 100 ""
+)
+
+# ---- op_graduate  (S-10, Feature #1354) --------------------------------------
+# Migrate a flash (layering) entity to the PASSTHROUGH backend on a capable
+# device: flush → consolidate to ONE layer → copy into the plain passthrough
+# dir → verify → write-ahead intent → MOVE layers to .graduated/ (14-day
+# retention, never deleted here) → manifest backend flip + expected-layers
+# clear in ONE locked write → clear intent → rebind the mount via the
+# passthrough path. Exit contract: 0 ok · 2 deferred (transient; reason
+# marker) · 4 precondition failed (reason marker graduate_precondition) ·
+# 1 hard failure.
+#
+# CRASH ARMS (both sides of the manifest write — THE authority flip):
+#   • Killed BEFORE the manifest write: the layers are still authoritative.
+#     Either they are still on disk (intent written, move not yet done →
+#     classifier sees a healthy flash entity; the populated passthrough dir +
+#     staging marker are inert garbage a retry converges over) or the single
+#     consolidated layer was already renamed into .graduated/ (the intent's
+#     "delete" plan marks it an intentional prune, so reconcile never halts;
+#     the supervisor's graduate-intent recovery completes the flip forward on
+#     the next tick because the verified passthrough copy is populated).
+#   • Killed AFTER the manifest write (before clear_intent): passthrough is
+#     authoritative — effective_backend un-pins via the recorded backend, the
+#     next mount binds the plain dir, and .graduated/ holds the rollback copy.
+#     The supervisor's recovery clears the stale intent.
+op_graduate() (
+set -euo pipefail
+TYPE="${1:-}"
+ID="${2:-}"
+PERSIST_PATH="${3:-}"
+
+source "$_SO_DIR/common.sh"
+install_failure_trap "$TYPE" "$ID" "graduate"
+source "$_SO_DIR/resolve_paths.sh" 2>/dev/null || true
+# manifest_set_backend — the single locked backend writer (manifest_write.sh).
+source "$_SO_DIR/manifest_write.sh" 2>/dev/null || true
+
+log() {
+    local msg
+    msg="[$(get_ts)] [INFO] [GRADUATE] $(_trace_tag)$1"
+    echo "$msg"
+    echo "$msg" >> "$DEBUG_LOG"
+}
+error() {
+    local msg
+    msg="[$(get_ts)] [ERR!] [GRADUATE] $(_trace_tag)$1"
+    echo "$msg"
+    echo "$msg" >> "$DEBUG_LOG"
+}
+
+if [ -z "$TYPE" ] || [ -z "$ID" ] || [ -z "$PERSIST_PATH" ]; then
+    error "usage: op_graduate <home|agent> <id> <persist>"
+    exit 1
+fi
+
+guard_path "$PERSIST_PATH" "PERSIST_PATH" || { error "Persistence path failed validation: $PERSIST_PATH"; exit 1; }
+_assert_persist_durable "$PERSIST_PATH" || { error "Persistence path is on a non-durable filesystem — graduate refused"; exit 1; }
+
+_GR_LOCK_ID="${ID//[^a-zA-Z0-9_-]/_}"
+# Clear any stale defer-reason marker so the reason PHP reads is THIS run's truth.
+rm -f "/tmp/unraid-aicliagents/.bake_defer_reason_${TYPE}_${_GR_LOCK_ID}" 2>/dev/null || true
+
+_entity_paths "$TYPE" "$ID" "$PERSIST_PATH"   # UPPER_DIR/WORK_DIR/MNT_POINT/ENTITY_UPPER_MODE
+
+# _gr_precondition_refuse <reason> — marker + lifecycle + exit 4 (precondition).
+_gr_precondition_refuse() {
+    local _why="$1"
+    error "Graduate precondition failed: $_why"
+    write_defer_reason "$TYPE" "$ID" "graduate_precondition"
+    lifecycle_log "info" "graduate" "graduate_precondition_failed" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"why\":\"$_why\"}" 2>/dev/null || true
+    exit 4
+}
+
+# ---- 1. Precondition (pure helper + live facts) ------------------------------
+declare -f graduate_precondition_from_facts >/dev/null 2>&1 \
+    || { error "detect_backend.sh helpers unavailable — refusing"; exit 1; }
+_GR_HAS_LAYERS="$(_entity_has_layers "$PERSIST_PATH" "$TYPE" "$ID")"
+_GR_EFFECTIVE="$(effective_backend "$TYPE" "$ID" "$PERSIST_PATH")"
+_GR_DEVICE="${AICLI_ITEST_BACKEND:-$(backend_for "$PERSIST_PATH")}"
+_GR_ENGINE="$(probe_target "$PERSIST_PATH" 2>/dev/null | grep -oE '"engine":"[a-z]+"' | cut -d'"' -f4)"
+_GR_ENGINE="${_GR_ENGINE:-layering}"
+if _GR_WHY="$(graduate_precondition_from_facts "$_GR_ENGINE" "$_GR_DEVICE" "$_GR_EFFECTIVE" "$_GR_HAS_LAYERS")"; then
+    log "Precondition ok (engine=$_GR_ENGINE device=$_GR_DEVICE effective=$_GR_EFFECTIVE has_layers=$_GR_HAS_LAYERS)"
+else
+    _gr_precondition_refuse "$_GR_WHY"
+fi
+
+lifecycle_log "info" "graduate" "graduate_start" \
+    "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"persist_path\":\"$PERSIST_PATH\"}" 2>/dev/null || true
+
+# ---- 2. Flush the upper (op_bake path; serialises itself on the bake lock) ---
+log "Flushing upper before migration (op_bake)..."
+if op_bake "$TYPE" "$ID" "$PERSIST_PATH"; then :; else
+    _gr_rc=$?
+    if [ "$_gr_rc" -eq 2 ]; then
+        log "Flush deferred (busy) — graduate deferred; retry when idle."
+        exit 2    # op_bake already wrote its reason marker + lifecycle event
+    fi
+    [ "$_gr_rc" -eq 4 ] && exit 4
+    error "Flush bake failed (rc=$_gr_rc) — aborting graduate."
+    exit 1
+fi
+
+# ---- 3. Consolidate to ONE layer (only when >1; a single layer of any kind
+#         already holds the entity's complete durable content) ----------------
+_GR_COUNT="$(_layer_discover_sorted "$PERSIST_PATH" "$TYPE" "$ID" | awk 'NF{c++}END{print c+0}')"
+if [ "$_GR_COUNT" -gt 1 ]; then
+    log "Consolidating $_GR_COUNT layers to one (op_consolidate)..."
+    if op_consolidate "$TYPE" "$ID" "$PERSIST_PATH"; then :; else
+        _gr_rc=$?
+        if [ "$_gr_rc" -eq 2 ]; then
+            log "Consolidate deferred — graduate deferred; retry when idle."
+            exit 2
+        fi
+        [ "$_gr_rc" -eq 4 ] && exit 4
+        error "Consolidate failed (rc=$_gr_rc) — aborting graduate (nothing destructive happened)."
+        exit 1
+    fi
+fi
+
+# Re-discover: the migration source must be EXACTLY one layer.
+mapfile -t _GR_LAYERS < <(_layer_discover_sorted "$PERSIST_PATH" "$TYPE" "$ID")
+if [ "${#_GR_LAYERS[@]}" -eq 0 ]; then
+    error "No layers on disk after flush/consolidate — nothing to graduate (inconsistent state)."
+    exit 1
+fi
+if [ "${#_GR_LAYERS[@]}" -gt 1 ]; then
+    log "More than one layer after consolidate (a bake landed) — deferring."
+    _op_defer "$TYPE" "$ID" "graduate" "graduate_deferred" "bake_landed_during_consolidate" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"layers\":${#_GR_LAYERS[@]}}"
+fi
+_GR_SRC_LAYER="${_GR_LAYERS[0]}"
+_GR_SRC_BASE="$(basename "$_GR_SRC_LAYER")"
+
+# ---- 4. Idle + flushed checks ------------------------------------------------
+if home_mount_in_use "$MNT_POINT"; then
+    log "Home is busy (live session) — deferring graduate."
+    _op_defer "$TYPE" "$ID" "graduate" "graduate_deferred" "mount_busy" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"mount_point\":\"$MNT_POINT\"}"
+fi
+# The upper must be EMPTY of files: anything left was NOT captured by the
+# flush/consolidate above (e.g. writes that landed mid-bake) and would be
+# silently stranded once the entity stops using the layering engine.
+if [ -d "$UPPER_DIR" ] && [ -n "$(find "$UPPER_DIR" -type f -print -quit 2>/dev/null)" ]; then
+    log "Upper still holds unflushed files after flush+consolidate — deferring graduate."
+    _op_defer "$TYPE" "$ID" "graduate" "graduate_deferred" "upper_not_empty" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"upper\":\"$UPPER_DIR\"}"
+fi
+
+# ---- 5. Copy the consolidated content into the passthrough plain dir ---------
+# Layout MUST match storagectl _pt_dir: $PERSIST/passthrough/<type>s/<id>
+_GR_PT_DIR="$PERSIST_PATH/passthrough/${TYPE}s/$ID"
+_GR_STAGING_MARKER="$PERSIST_PATH/.graduate_staging_${TYPE}_${_GR_LOCK_ID}"
+_GR_INTENT_EXISTS=0
+[ -f "$(_intent_path "$PERSIST_PATH" "$TYPE" "$ID")" ] && _GR_INTENT_EXISTS=1
+if [ -d "$_GR_PT_DIR" ] && [ -n "$(find "$_GR_PT_DIR" -mindepth 1 -print -quit 2>/dev/null)" ] \
+    && [ ! -f "$_GR_STAGING_MARKER" ] && [ "$_GR_INTENT_EXISTS" -eq 0 ]; then
+    # A populated pt dir we did NOT stage could be pre-existing user data from an
+    # earlier passthrough life — never overwrite/delete it (data-safety).
+    _gr_precondition_refuse "pt_dir_occupied"
+fi
+
+_GR_SCRATCH="/tmp/unraid-aicliagents/.graduate_src_${TYPE}_${_GR_LOCK_ID}_$$"
+mkdir -p "$_GR_SCRATCH" 2>/dev/null
+_gr_cleanup_scratch() {
+    mountpoint -q "$_GR_SCRATCH" 2>/dev/null && { umount "$_GR_SCRATCH" 2>/dev/null || umount -l "$_GR_SCRATCH" 2>/dev/null || true; }
+    rmdir "$_GR_SCRATCH" 2>/dev/null || true
+}
+if ! mount -o loop,ro "$_GR_SRC_LAYER" "$_GR_SCRATCH" 2>/dev/null; then
+    error "Cannot mount $_GR_SRC_BASE read-only for the copy."
+    _gr_cleanup_scratch
+    exit 1
+fi
+
+# Disk-space preflight: the plain copy needs roughly the UNCOMPRESSED size.
+_GR_SRC_BYTES="$(du -sb "$_GR_SCRATCH" 2>/dev/null | awk '{print $1}')"
+case "$_GR_SRC_BYTES" in ''|*[!0-9]*) _GR_SRC_BYTES=0 ;; esac
+_GR_NEED_MB=$(( _GR_SRC_BYTES / 1048576 + 100 ))
+if ! check_disk_space "$PERSIST_PATH/.diskcheck" "$_GR_NEED_MB"; then
+    error "Insufficient space on $PERSIST_PATH for the passthrough copy (${_GR_NEED_MB}MB needed)."
+    _gr_cleanup_scratch
+    exit 1
+fi
+
+: > "$_GR_STAGING_MARKER" 2>/dev/null || true
+mkdir -p "$_GR_PT_DIR" 2>/dev/null
+log "Copying $_GR_SRC_BASE → $_GR_PT_DIR (rsync -aHX, $_GR_SRC_BYTES bytes)..."
+if ! rsync -aHX --delete "$_GR_SCRATCH/" "$_GR_PT_DIR/" 2>>"$DEBUG_LOG"; then
+    error "rsync into the passthrough dir failed — aborting (layers untouched; staging marker kept for retry convergence)."
+    _gr_cleanup_scratch
+    exit 1
+fi
+
+# ---- 6. Verify: file count + sampled sha256 ----------------------------------
+_GR_SRC_COUNT="$(find "$_GR_SCRATCH" -type f 2>/dev/null | wc -l | tr -d ' ')"
+_GR_DST_COUNT="$(find "$_GR_PT_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$_GR_SRC_COUNT" != "$_GR_DST_COUNT" ]; then
+    error "Copy verify failed: file count src=$_GR_SRC_COUNT dst=$_GR_DST_COUNT — aborting (layers untouched)."
+    _gr_cleanup_scratch
+    exit 1
+fi
+_GR_VERIFY_FAIL=0
+while IFS= read -r _gr_f; do
+    [ -n "$_gr_f" ] || continue
+    _gr_rel="${_gr_f#"$_GR_SCRATCH"/}"
+    _gr_src_sha="$(sha256sum "$_gr_f" 2>/dev/null | awk '{print $1}')"
+    _gr_dst_sha="$(sha256sum "$_GR_PT_DIR/$_gr_rel" 2>/dev/null | awk '{print $1}')"
+    if [ -z "$_gr_src_sha" ] || [ "$_gr_src_sha" != "$_gr_dst_sha" ]; then
+        error "Copy verify failed: sha256 mismatch on '$_gr_rel'."
+        _GR_VERIFY_FAIL=1
+        break
+    fi
+done < <(find "$_GR_SCRATCH" -type f 2>/dev/null | head -5)
+if [ "$_GR_VERIFY_FAIL" -ne 0 ]; then
+    _gr_cleanup_scratch
+    exit 1
+fi
+_gr_cleanup_scratch
+log "Copy verified ($_GR_DST_COUNT files, sampled sha256 ok)."
+
+# ---- 7. CRITICAL SECTION: per-entity bake lock -------------------------------
+# Same lock op_bake holds (fd 9) — excludes a concurrent bake AND the
+# supervisor's reconcile pass for the whole authority flip below.
+_GR_BAKE_LOCK="/var/run/aicli-bake-${TYPE}-${_GR_LOCK_ID}.lock"
+exec 9>"$_GR_BAKE_LOCK"
+if ! flock -n 9; then
+    log "Per-entity bake lock held — deferring graduate."
+    _op_defer "$TYPE" "$ID" "graduate" "graduate_deferred" "bake_lock_held"
+fi
+
+# Re-validate under the lock: the layer set must still be exactly the one we
+# copied. A delta that landed during the rsync makes the pt copy stale — defer
+# (the copy converges on retry; nothing destructive has happened).
+mapfile -t _GR_NOW_LAYERS < <(_layer_discover_sorted "$PERSIST_PATH" "$TYPE" "$ID")
+if [ "${#_GR_NOW_LAYERS[@]}" -ne 1 ] || [ "$(basename "${_GR_NOW_LAYERS[0]}")" != "$_GR_SRC_BASE" ]; then
+    log "Layer set changed during the copy (a bake landed) — deferring graduate."
+    _op_defer "$TYPE" "$ID" "graduate" "graduate_deferred" "bake_landed_during_consolidate" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"expected\":\"$_GR_SRC_BASE\"}"
+fi
+
+# ---- 8. Write-ahead intent → move → manifest flip → clear --------------------
+# Intent format mirrors consolidate's ({"op",...,"delete":[...]}) so the
+# reconcile/boot intentional-prune readers treat the moved layer as benign.
+write_intent "$PERSIST_PATH" "$TYPE" "$ID" \
+    "{\"op\":\"graduate\",\"keep\":\"\",\"pt_dir\":\"$_GR_PT_DIR\",\"files\":$_GR_DST_COUNT,\"delete\":[\"$_GR_SRC_BASE\"]}"
+_itest_sigkill_window "graduate_after_intent"
+
+_GR_RETIRE_DIR="$PERSIST_PATH/.graduated/${TYPE}_${_GR_LOCK_ID}"
+mkdir -p "$_GR_RETIRE_DIR" 2>/dev/null
+log "Retiring layer to $_GR_RETIRE_DIR (move, NOT delete — 14-day retention)..."
+if ! mv -f "$_GR_SRC_LAYER" "$_GR_RETIRE_DIR/" 2>>"$DEBUG_LOG"; then
+    error "Failed to move $_GR_SRC_BASE to .graduated/ — rolling back (clearing intent; layers authoritative)."
+    clear_intent "$PERSIST_PATH" "$TYPE" "$ID"
+    exit 1
+fi
+_itest_sigkill_window "graduate_after_move"
+
+# The authority flip: backend=passthrough + expected_layers cleared in ONE
+# locked manifest write (LayerManifestService::setBackend).
+if ! manifest_set_backend "$TYPE" "$ID" "passthrough"; then
+    error "Manifest backend flip FAILED — rolling back (restoring layer from .graduated/)."
+    mv -f "$_GR_RETIRE_DIR/$_GR_SRC_BASE" "$PERSIST_PATH/" 2>>"$DEBUG_LOG" || \
+        error "ROLLBACK MOVE FAILED — layer remains at $_GR_RETIRE_DIR/$_GR_SRC_BASE (recover manually)."
+    clear_intent "$PERSIST_PATH" "$TYPE" "$ID"
+    exit 1
+fi
+_itest_sigkill_window "graduate_after_manifest"
+
+rm -f "$_GR_STAGING_MARKER" 2>/dev/null || true
+clear_intent "$PERSIST_PATH" "$TYPE" "$ID"
+lifecycle_log "info" "graduate" "graduate_ok" \
+    "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"pt_dir\":\"$_GR_PT_DIR\",\"retired\":\"$_GR_SRC_BASE\",\"files\":$_GR_DST_COUNT,\"bytes\":$_GR_SRC_BYTES}" 2>/dev/null || true
+log "Graduation complete: $TYPE/$ID is now passthrough at $_GR_PT_DIR ($_GR_SRC_BASE retained in .graduated/)."
+
+# ---- 9. Remount via the passthrough path (best-effort) ------------------------
+# Tear down the flash overlay (its lowers point at the retired layer's loop
+# mounts) and bind the plain dir at the entity's normal mount point — the same
+# bind _pt_mount performs. A busy/phantom mount is left alone: the graduation
+# is durable, and the next normal mount routes through the passthrough guard.
+if _mount_teardown_arbiter "$MNT_POINT"; then _GR_TD=0; else _GR_TD=$?; fi
+if [ "$_GR_TD" -eq 0 ]; then
+    # Lift this entity's now-orphaned layer loop mounts.
+    for _gr_lm in /tmp/unraid-aicliagents/mnt/${TYPE}_${ID}_*; do
+        [ -d "$_gr_lm" ] || continue
+        mountpoint -q "$_gr_lm" 2>/dev/null && { umount "$_gr_lm" 2>/dev/null || umount -l "$_gr_lm" 2>/dev/null || true; }
+        rmdir "$_gr_lm" 2>/dev/null || true
+    done
+    [ -L "$MNT_POINT" ] && rm -f "$MNT_POINT"
+    mkdir -p "$MNT_POINT" 2>/dev/null
+    _GR_OWNER=""
+    [ "$TYPE" = "home" ] && _GR_OWNER="$ID"
+    if [ -n "$_GR_OWNER" ] && [ "$_GR_OWNER" != "root" ] && id "$_GR_OWNER" >/dev/null 2>&1; then
+        chown "$_GR_OWNER" "$_GR_PT_DIR" "$MNT_POINT" 2>/dev/null || true
+    fi
+    if mount --bind "$_GR_PT_DIR" "$MNT_POINT" 2>/dev/null; then
+        lifecycle_log "info" "storagectl" "passthrough_mount" "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"dir\":\"$_GR_PT_DIR\"}" 2>/dev/null || true
+        log "Passthrough bind mounted at $MNT_POINT."
+    else
+        log "Passthrough bind failed (non-fatal) — the next mount binds via the passthrough path."
+    fi
+else
+    log "Mount point busy/phantom (rc=$_GR_TD) — leaving as-is; the next mount cycle binds the passthrough dir."
+    lifecycle_log "warn" "graduate" "graduate_remount_deferred" \
+        "{\"type\":\"$TYPE\",\"id\":\"$ID\",\"rc\":$_GR_TD}" 2>/dev/null || true
+fi
+exit 0
 )

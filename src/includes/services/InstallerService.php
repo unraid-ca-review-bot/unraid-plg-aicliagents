@@ -34,7 +34,7 @@ class InstallerService {
         
         // 1. D-321: Ensure storage is mounted before install so changes go to ZRAM upperdir
         // If already mounted, this is a no-op. If not, it sets up the OverlayFS stack.
-        if (!StorageMountService::ensureAgentMounted($agentId)) {
+        if (!FileStorage::ensureReady("agent/$agentId")->ok) {   // Epic #1310: facade intent
             LogService::log("Failed to mount storage stack for $agentId", LogService::LOG_ERROR, "InstallerService");
             setInstallStatus("Storage error", 0, $agentId, "Mount failure");
             return ['status' => 'error', 'message' => 'Could not mount agent storage'];
@@ -49,6 +49,34 @@ class InstallerService {
             LogService::log("Installation aborted: Agent $agentId not found in registry.", LogService::LOG_ERROR, "InstallerService");
             return ['status' => 'error', 'message' => 'Agent not found in registry'];
         }
+
+        // An omitted version means "use my selected release channel", not
+        // npm's moving `latest` tag. Resolve it once, before any binary fetch or
+        // replacement, so immediate, queued, forced, repair and reinstall paths
+        // all obey the same Stable/Beta/Pinned contract.
+        $resolution = VersionCheckService::resolveInstallTarget($agentId, $targetVersion);
+        if ($resolution['target'] === null || $resolution['error'] !== null) {
+            $reason = $resolution['error'] ?? 'unresolved_channel_target';
+            LogService::log("Install target resolution failed for $agentId: $reason", LogService::LOG_ERROR, "InstallerService");
+            setInstallStatus("Release channel error", 0, $agentId, $reason);
+            return ['status' => 'error', 'message' => $reason];
+        }
+        $targetVersion = $resolution['target'];
+        LogService::log(
+            "Resolved install target for $agentId: channel={$resolution['channel']} tag="
+            . ($resolution['resolved_tag'] ?? 'explicit') . " version=$targetVersion fallback="
+            . ($resolution['fallback'] ? 'yes' : 'no'),
+            $resolution['fallback'] ? LogService::LOG_WARN : LogService::LOG_INFO,
+            "InstallerService"
+        );
+        LifecycleLogService::log(LifecycleLogService::LEVEL_INFO, 'installer', 'agent_install_target_resolved', [
+            'agent' => $agentId,
+            'channel' => $resolution['channel'],
+            'resolved_tag' => $resolution['resolved_tag'],
+            'version' => $targetVersion,
+            'fallback' => $resolution['fallback'],
+            'explicit' => $resolution['explicit'],
+        ]);
 
         // Do NOT pre-remove the saved version. Keeping the old version while
         // the install is in-flight prevents the "v?" badge UX glitch when the
@@ -73,7 +101,7 @@ class InstallerService {
         }
 
         $desc = SourceResolver::descriptor($agent);
-        LogService::log("Using source type '" . ($desc['type'] ?? '?') . "' for $agentId (target=" . ($targetVersion ?? 'latest') . ")", LogService::LOG_INFO, "InstallerService");
+        LogService::log("Using source type '" . ($desc['type'] ?? '?') . "' for $agentId (target=$targetVersion)", LogService::LOG_INFO, "InstallerService");
         setInstallStatus("Starting install...", 20, $agentId);
 
         $ok = $source->fetch($agentId, $agent, $targetVersion, function(string $msg, int $pct) use ($agentId) {
@@ -111,7 +139,7 @@ class InstallerService {
         // Bug #512: previously a sync StorageMigrationService::consolidateEntity
         // call ran here (D-332 phase 6), redundant with the post-bake trigger
         // and a source of install-time mount races.
-        $res = StorageMountService::commitChanges('agent', $agentId);
+        $res = FileStorage::persist("agent/$agentId")->exit;   // Epic #1310: facade intent (delegates to commitChanges)
         if ($res === 1) {
             LogService::log("Installer: Critical error during persistence bake for $agentId.", LogService::LOG_ERROR, "InstallerService");
             setInstallStatus("Install Failed (Bake Error)", 0, $agentId);
@@ -123,7 +151,15 @@ class InstallerService {
             LogService::log("Installer: Layer compaction busy for $agentId — install proceeded with delta bake fallback.", LogService::LOG_WARN, "InstallerService");
         }
 
-        setInstallStatus("Installation complete", 100, $agentId);
+        // install-bg owns agent-layer activation + closed-session relaunch. Do
+        // not publish 100% before that state machine finishes: the terminal UI
+        // treats completion as permission to reopen the retired ttyd id.
+        $deferCompletion = getenv('AICLI_DEFER_INSTALL_COMPLETION') === '1';
+        if ($deferCompletion) {
+            setInstallStatus("Activating upgraded version...", 95, $agentId);
+        } else {
+            setInstallStatus("Installation complete", 100, $agentId);
+        }
 
         // Post-install: invalidate version cache and clear update notifications
         VersionCheckService::invalidateAgent($agentId);
@@ -144,6 +180,18 @@ class InstallerService {
         } catch (\Throwable $e) {
             // Seeding must never fail an install — log and continue.
             LogService::log("Installer: default_envs seed failed for $agentId: " . $e->getMessage(),
+                LogService::LOG_WARN, "InstallerService");
+        }
+
+        // File-path-convention policy block (docs/specs/AGENT_FILE_PATH_CONVENTION.md):
+        // best-effort, immediate injection so a freshly installed/upgraded agent has
+        // the block without waiting for a full hub "Apply to agents" pass. Never
+        // fails the install — same try/catch discipline as the env seed above.
+        try {
+            require_once __DIR__ . '/hub/HubProjector.php';
+            \AICliAgents\Services\Hub\HubProjector::projectPolicy([$agentId]);
+        } catch (\Throwable $e) {
+            LogService::log("Installer: file-path policy projection failed for $agentId: " . $e->getMessage(),
                 LogService::LOG_WARN, "InstallerService");
         }
 
@@ -187,8 +235,24 @@ class InstallerService {
 
         setInstallStatus("Installing $package to RAM...", 20, $agentId);
 
+        $resolution = VersionCheckService::resolveInstallTarget($agentId, null);
+        if ($resolution['target'] === null || $resolution['error'] !== null) {
+            $reason = $resolution['error'] ?? 'unresolved_channel_target';
+            LogService::log("Emergency install target resolution failed for $agentId: $reason", LogService::LOG_ERROR, "InstallerService");
+            setInstallStatus("Release channel error", 0, $agentId, $reason);
+            return ['status' => 'error', 'message' => $reason];
+        }
+        $targetVersion = $resolution['target'];
+        LogService::log(
+            "EMERGENCY INSTALL target: channel={$resolution['channel']} tag="
+            . ($resolution['resolved_tag'] ?? 'explicit') . " version=$targetVersion fallback="
+            . ($resolution['fallback'] ? 'yes' : 'no'),
+            $resolution['fallback'] ? LogService::LOG_WARN : LogService::LOG_INFO,
+            "InstallerService"
+        );
+
         // Direct npm install — no SquashFS, no ZRAM overlay
-        $cmd = "export PATH=$pluginDir/bin:\$PATH; cd " . escapeshellarg($agentDir) . " && npm install " . escapeshellarg($package . "@latest") . " --no-audit --no-fund --loglevel info 2>&1";
+        $cmd = "export PATH=$pluginDir/bin:\$PATH; cd " . escapeshellarg($agentDir) . " && npm install " . escapeshellarg($package . "@$targetVersion") . " --no-audit --no-fund --loglevel info 2>&1";
 
         $currentProgress = 20;
         $res = UtilityService::execStreaming($cmd, function($line, $isError) use ($agentId, &$currentProgress) {
@@ -278,6 +342,10 @@ class InstallerService {
         // 7. Remove workspace sessions that used this agent (keep home data intact)
         try {
             $ws = ConfigService::getWorkspaces();
+            $removedIds = array_values(array_map(
+                static fn($s) => (string)($s['id'] ?? ''),
+                array_filter($ws['sessions'] ?? [], static fn($s) => ($s['agentId'] ?? '') === $agentId)
+            ));
             $before = count($ws['sessions'] ?? []);
             $ws['sessions'] = array_values(array_filter($ws['sessions'] ?? [], function($s) use ($agentId) {
                 return ($s['agentId'] ?? '') !== $agentId;
@@ -292,22 +360,22 @@ class InstallerService {
                     }
                     if (!$activeStillExists) $ws['activeId'] = !empty($ws['sessions']) ? $ws['sessions'][0]['id'] : null;
                 }
-                ConfigService::saveWorkspaces($ws);
+                ConfigService::saveWorkspaces($ws, $removedIds);
                 LogService::log("Removed $removed workspace session(s) for $agentId.", LogService::LOG_INFO, "InstallerService");
             }
         } catch (\Throwable $e) {
             LogService::log("Warning: Could not clean workspace sessions: " . $e->getMessage(), LogService::LOG_WARN, "InstallerService");
         }
 
-        // 8. Remove version registration
-        AgentRegistry::removeVersion($agentId);
+        // 8. Remove version registration (R4: clearVersion also purges passthrough-only entries)
+        AgentRegistry::clearVersion($agentId);
 
         // 9. Remove the agent's manifest entry (WP #916). Without this, the
         // boot-integrity sweep on the next reboot finds `expected_layers > 0,
         // active_count == 0` and creates a total_loss halt for an agent the
         // user just deliberately uninstalled — surfacing a scary "Storage
         // Unavailable / drive may be disconnected" overlay for a ghost.
-        @\AICliAgents\Services\LayerManifestService::removeEntity("agent/$agentId");
+        @\AICliAgents\Services\FileStorage::dropManifestEntry("agent/$agentId");   // Epic #1310 facade intent
 
         // 10. Clear any pending halt for the agent. If uninstall is happening
         // BECAUSE the agent was halted, the halt sentinel survives the
@@ -333,6 +401,66 @@ class InstallerService {
         return is_dir($path) ? $path : '/';
     }
 
+    /** Inspect either storage backend without assuming every agent uses SquashFS. */
+    public static function inspectUpgradeBackupSource(string $agentId, string $persistPath): array {
+        $safe = preg_replace('/[^A-Za-z0-9._-]/', '', $agentId);
+        $layers = glob(rtrim($persistPath, '/') . "/agent_{$safe}_*.sqsh") ?: [];
+        if ($layers !== []) {
+            $bytes = 0;
+            foreach ($layers as $layer) $bytes += (int)@filesize($layer);
+            return ['format' => 'squashfs', 'bytes' => $bytes, 'layers' => $layers, 'path' => null];
+        }
+
+        $path = rtrim($persistPath, '/') . "/passthrough/agents/$safe";
+        if (!is_dir($path)) {
+            return ['format' => 'unavailable', 'bytes' => 0, 'layers' => [], 'path' => null];
+        }
+        return ['format' => 'passthrough', 'bytes' => self::directorySize($path), 'layers' => [], 'path' => $path];
+    }
+
+    private static function directorySize(string $dir): int {
+        if (!is_dir($dir)) return 0;
+        $bytes = 0;
+        try {
+            $it = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS)
+            );
+            foreach ($it as $item) {
+                if ($item->isFile() && !$item->isLink()) $bytes += (int)$item->getSize();
+            }
+        } catch (\UnexpectedValueException $e) {
+            return 0;
+        }
+        return $bytes;
+    }
+
+    private static function copyDirectory(string $source, string $dest): bool {
+        if (!is_dir($source)) return false;
+        $sourceReal = realpath($source);
+        $destAncestor = realpath(self::resolveExistingAncestor($dest));
+        if ($sourceReal !== false && $destAncestor !== false
+            && ($destAncestor === $sourceReal || strpos($destAncestor, $sourceReal . DIRECTORY_SEPARATOR) === 0)) {
+            return false; // Never recursively copy a directory into itself.
+        }
+        if (!is_dir($dest) && !@mkdir($dest, 0755, true) && !is_dir($dest)) return false;
+        $it = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($source, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::SELF_FIRST
+        );
+        foreach ($it as $item) {
+            $relative = substr($item->getPathname(), strlen(rtrim($source, '/')) + 1);
+            $target = rtrim($dest, '/') . '/' . $relative;
+            if ($item->isLink()) {
+                if (!@symlink((string)readlink($item->getPathname()), $target)) return false;
+            } elseif ($item->isDir()) {
+                if (!is_dir($target) && !@mkdir($target, $item->getPerms() & 0777, true) && !is_dir($target)) return false;
+            } elseif (!@copy($item->getPathname(), $target)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * WP #964 (slice): estimate the disk cost of backing up an agent's current
      * version before an upgrade, and check the destination has room.
@@ -348,9 +476,9 @@ class InstallerService {
         $persistPath = $config['agent_storage_path'] ?? '/boot/config/plugins/unraid-aicliagents';
         $destPath = trim($destPath) !== '' ? trim($destPath) : $persistPath;
 
-        $layers = glob("$persistPath/agent_{$agentId}_*.sqsh") ?: [];
-        $currentSize = 0;
-        foreach ($layers as $l) $currentSize += (int)@filesize($l);
+        $source = self::inspectUpgradeBackupSource($agentId, $persistPath);
+        $layers = $source['layers'];
+        $currentSize = (int)$source['bytes'];
 
         // Guesstimate the new version's footprint as ~the current version's.
         $estimatedNewSize = $currentSize;
@@ -371,6 +499,7 @@ class InstallerService {
             'free'               => $free,
             'sufficient'         => ($currentSize > 0 && $free >= $required),
             'layer_count'        => count($layers),
+            'storage_format'     => $source['format'],
         ];
     }
 
@@ -389,9 +518,10 @@ class InstallerService {
         $config = ConfigService::getConfig();
         $persistPath = $config['agent_storage_path'] ?? '/boot/config/plugins/unraid-aicliagents';
 
-        $layers = glob("$persistPath/agent_{$agentId}_*.sqsh") ?: [];
-        if (empty($layers)) {
-            return ['status' => 'error', 'message' => "No SquashFS layers found for $agentId — nothing to back up"];
+        $source = self::inspectUpgradeBackupSource($agentId, $persistPath);
+        $layers = $source['layers'];
+        if ($source['format'] === 'unavailable' || (int)$source['bytes'] <= 0) {
+            return ['status' => 'error', 'message' => "No persisted agent installation found for $agentId — nothing to back up"];
         }
 
         $version = AgentRegistry::getInstalledVersion($agentId);
@@ -421,16 +551,24 @@ class InstallerService {
         }
 
         $copied = [];
-        foreach ($layers as $layer) {
-            $base = basename($layer);
-            if (!@copy($layer, "$backupDir/$base")) {
-                // Roll back the partial backup so a failed attempt leaves nothing.
-                foreach ($copied as $c) @unlink("$backupDir/$c");
-                @unlink("$backupDir/meta.json");
+        $payload = null;
+        if ($source['format'] === 'passthrough') {
+            $payload = 'passthrough';
+            if (!self::copyDirectory((string)$source['path'], "$backupDir/$payload")) {
+                self::rmdirContents($backupDir);
                 @rmdir($backupDir);
-                return ['status' => 'error', 'message' => "Failed to copy layer $base to $backupDir"];
+                return ['status' => 'error', 'message' => "Failed to copy the passthrough installation to $backupDir"];
             }
-            $copied[] = $base;
+        } else {
+            foreach ($layers as $layer) {
+                $base = basename($layer);
+                if (!@copy($layer, "$backupDir/$base")) {
+                    self::rmdirContents($backupDir);
+                    @rmdir($backupDir);
+                    return ['status' => 'error', 'message' => "Failed to copy layer $base to $backupDir"];
+                }
+                $copied[] = $base;
+            }
         }
 
         @file_put_contents("$backupDir/meta.json", json_encode([
@@ -438,14 +576,21 @@ class InstallerService {
             'version'    => $version,
             'created_at' => $dt,
             'layers'     => $copied,
+            'storage_format' => $source['format'],
+            'payload'    => $payload,
         ], JSON_PRETTY_PRINT));
 
         $bytes = 0;
         foreach ($copied as $c) $bytes += (int)@filesize("$backupDir/$c");
+        if ($payload !== null) $bytes = self::directorySize("$backupDir/$payload");
         LogService::log("Backed up $agentId v$version (" . count($copied) . " layer(s), "
             . round($bytes / 1048576, 1) . " MB) to $backupDir", LogService::LOG_INFO, "InstallerService");
         LifecycleLogService::log(LifecycleLogService::LEVEL_INFO, 'installer', 'agent_version_backed_up',
             ['agent' => $agentId, 'version' => $version, 'dir' => $backupDir, 'bytes' => $bytes]);
+
+        // WP #964: enforce the retention cap NOW that a new version is retained, so the
+        // aicli-rollback tree can't grow unbounded on Flash across many upgrades.
+        self::pruneRetainedBackups($agentId, $destPath, self::rollbackRetainMax());
 
         return ['status' => 'ok', 'dir' => $backupDir, 'version' => $version, 'layers' => $copied, 'bytes' => $bytes];
     }
@@ -469,12 +614,16 @@ class InstallerService {
             if (!is_array($meta) || empty($meta['version'])) continue;
             $bytes = 0;
             foreach ((array)($meta['layers'] ?? []) as $l) $bytes += (int)@filesize("$dir/$l");
+            if (($meta['storage_format'] ?? '') === 'passthrough' && !empty($meta['payload'])) {
+                $bytes = self::directorySize("$dir/" . basename((string)$meta['payload']));
+            }
             $out[] = [
                 'version'     => (string)$meta['version'],
                 'created_at'  => (string)($meta['created_at'] ?? ''),
                 'dir'         => $dir,
                 'bytes'       => $bytes,
                 'layer_count' => count((array)($meta['layers'] ?? [])),
+                'storage_format' => (string)($meta['storage_format'] ?? 'squashfs'),
             ];
         }
         // Newest first — the meta created_at is the YYYYMMDDTHHMMSSZ stamp.
@@ -493,6 +642,61 @@ class InstallerService {
             $deduped[] = $entry;
         }
         return $deduped;
+    }
+
+    /** Configured rollback retention cap — how many DISTINCT versions to keep per
+     *  agent. Default 2 (the previous + one older); clamped to [1, 10]. WP #964. */
+    public static function rollbackRetainMax(): int {
+        $raw = (int)(ConfigService::getConfig()['rollback_retain_max'] ?? 2);
+        if ($raw < 1)  $raw = 1;
+        if ($raw > 10) $raw = 10;
+        return $raw;
+    }
+
+    /**
+     * WP #964: enforce the rollback retention cap. Keeps only the newest $keep
+     * DISTINCT versions under <dest>/aicli-rollback/<agent>, deleting older versions
+     * AND any same-version duplicate dirs — so retained backups can't grow unbounded
+     * on Flash (an agent layer is ~100 MB). The surviving set is exactly what the
+     * picker / listRetainedBackups show. Returns the directories pruned.
+     */
+    public static function pruneRetainedBackups(string $agentId, string $destPath, int $keep): array {
+        if (empty($agentId) || $destPath === '') return [];
+        if ($keep < 1) $keep = 1;
+        $base = rtrim($destPath, '/') . "/aicli-rollback/$agentId";
+        if (!is_dir($base)) return [];
+
+        // (version, created_at, dir), newest-first — same ordering as listRetainedBackups.
+        $entries = [];
+        foreach (glob("$base/*/meta.json") ?: [] as $metaFile) {
+            $meta = json_decode((string)@file_get_contents($metaFile), true);
+            if (!is_array($meta) || empty($meta['version'])) continue;
+            $entries[] = [
+                'version'    => (string)$meta['version'],
+                'created_at' => (string)($meta['created_at'] ?? ''),
+                'dir'        => dirname($metaFile),
+            ];
+        }
+        usort($entries, fn($a, $b) => strcmp($b['created_at'], $a['created_at']));
+
+        $keptVersions = [];
+        $pruned = [];
+        foreach ($entries as $e) {
+            $known = isset($keptVersions[$e['version']]);
+            if (!$known && count($keptVersions) < $keep) {
+                $keptVersions[$e['version']] = true; // newest of a new version, within cap → keep
+                continue;
+            }
+            // an older duplicate of a kept version, or a version beyond the cap → prune
+            self::rmdirContents($e['dir']);
+            @rmdir($e['dir']);
+            $pruned[] = $e['dir'];
+        }
+        if (!empty($pruned)) {
+            LogService::log("Pruned " . count($pruned) . " retained backup(s) for $agentId (cap=$keep): "
+                . implode(', ', array_map('basename', $pruned)), LogService::LOG_INFO, "InstallerService");
+        }
+        return $pruned;
     }
 
     /** PHP-native recursive delete of a directory's contents (leaves the dir). */
@@ -527,7 +731,11 @@ class InstallerService {
             return ['status' => 'error', 'message' => 'Not a retained backup for this agent'];
         }
         $meta = json_decode((string)@file_get_contents("$realBackup/meta.json"), true);
-        if (!is_array($meta) || empty($meta['version']) || empty($meta['layers'])) {
+        $storageFormat = (string)($meta['storage_format'] ?? 'squashfs');
+        $hasLayerPayload = !empty($meta['layers']);
+        $hasDirectoryPayload = $storageFormat === 'passthrough' && !empty($meta['payload'])
+            && is_dir("$realBackup/" . basename((string)$meta['payload']));
+        if (!is_array($meta) || empty($meta['version']) || (!$hasLayerPayload && !$hasDirectoryPayload)) {
             return ['status' => 'error', 'message' => 'Retained backup is missing or has no meta.json'];
         }
         $restoreVersion = (string)$meta['version'];
@@ -546,8 +754,52 @@ class InstallerService {
             // 1. Snapshot the current version so the user can roll forward.
             $cur = self::backupAgentVersion($agentId, $persistPath);
             if (($cur['status'] ?? '') !== 'ok'
-                && strpos((string)($cur['message'] ?? ''), 'No SquashFS layers') === false) {
+                && strpos((string)($cur['message'] ?? ''), 'nothing to back up') === false) {
                 return ['status' => 'error', 'message' => 'Could not snapshot the current version before restore: ' . ($cur['message'] ?? '?')];
+            }
+
+            // Passthrough backends have no SquashFS layers. Restore their
+            // retained directory snapshot with an off-to-the-side copy and a
+            // same-filesystem rename, then let FileStorage remount the bind.
+            if ($storageFormat === 'passthrough') {
+                $payload = "$realBackup/" . basename((string)$meta['payload']);
+                $current = rtrim($persistPath, '/') . "/passthrough/agents/$agentId";
+                $parent = dirname($current);
+                $stamp = gmdate('Ymd\THis\Z') . '-' . getmypid();
+                $staged = "$parent/.{$agentId}.restore-new-$stamp";
+                $retired = "$parent/.{$agentId}.restore-old-$stamp";
+
+                if (!self::copyDirectory($payload, $staged)) {
+                    self::rmdirContents($staged); @rmdir($staged);
+                    return ['status' => 'error', 'message' => 'Could not stage the retained passthrough installation'];
+                }
+                $released = FileStorage::release("agent/$agentId");
+                if (!$released->ok || $released->deferred) {
+                    self::rmdirContents($staged); @rmdir($staged);
+                    return ['status' => 'error', 'message' => 'Agent storage is still in use — close its sessions and retry'];
+                }
+
+                if (is_dir($current) && !@rename($current, $retired)) {
+                    self::rmdirContents($staged); @rmdir($staged);
+                    return ['status' => 'error', 'message' => 'Could not retire the current passthrough installation'];
+                }
+                if (!@rename($staged, $current)) {
+                    if (is_dir($retired)) @rename($retired, $current);
+                    self::rmdirContents($staged); @rmdir($staged);
+                    FileStorage::ensureReady("agent/$agentId");
+                    return ['status' => 'error', 'message' => 'Could not activate the retained passthrough installation'];
+                }
+                self::rmdirContents($retired); @rmdir($retired);
+
+                $remounted = FileStorage::ensureReady("agent/$agentId")->ok;
+                if (!$remounted) {
+                    return ['status' => 'error', 'message' => 'Retained installation restored, but the agent mount could not be reactivated'];
+                }
+                AgentRegistry::saveVersion($agentId, $restoreVersion);
+                VersionCheckService::invalidateAgent($agentId);
+                LifecycleLogService::log(LifecycleLogService::LEVEL_INFO, 'installer', 'agent_version_restored',
+                    ['agent' => $agentId, 'version' => $restoreVersion, 'from' => $realBackup, 'storage_format' => 'passthrough']);
+                return ['status' => 'ok', 'version' => $restoreVersion];
             }
 
             // 2. Copy the retained layer(s) into the persistence directory.
@@ -571,7 +823,7 @@ class InstallerService {
             }
 
             // 3. Point the manifest at the restored layer set.
-            \AICliAgents\Services\LayerManifestService::replaceLayers("agent/$agentId", $manifestLayers, $persistPath);
+            \AICliAgents\Services\FileStorage::pointManifestAtLayers("agent/$agentId", $manifestLayers, $persistPath);   // Epic #1310 facade intent
 
             // 4. Remove the superseded current-version layers (preserved in
             //    aicli-rollback by step 1). Under the lock — race-free.
@@ -588,7 +840,7 @@ class InstallerService {
             if (StorageMountService::isMounted($mnt)) {
                 StorageMountService::unmount($mnt);
             }
-            $remounted = StorageMountService::ensureAgentMounted($agentId);
+            $remounted = FileStorage::ensureReady("agent/$agentId")->ok;   // Epic #1310: facade intent
 
             // 7. Record the restored version.
             AgentRegistry::saveVersion($agentId, $restoreVersion);
@@ -620,6 +872,101 @@ class InstallerService {
             if (file_exists($f)) @unlink($f);
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Verify-live gate helpers (R3)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Pure: extract the agent overlay's lowerdir from /proc/mounts text.
+     * Returns null when the agent is not currently overlay-mounted.
+     */
+    public static function liveAgentLowerdir(string $agentId, string $mountsText): ?string
+    {
+        $safe   = preg_replace('/[^A-Za-z0-9._-]/', '', $agentId);
+        $needle = '/usr/local/emhttp/plugins/unraid-aicliagents/agents/' . $safe . ' ';
+        foreach (explode("\n", $mountsText) as $line) {
+            if (strpos($line, $needle) === false) continue;
+            if (preg_match('/lowerdir=([^,\s]+)/', $line, $m)) return $m[1];
+        }
+        return null;
+    }
+
+    /**
+     * True iff the live overlay lowerdir references the newest baked layer.
+     * $newestLayerBasename is the basename of the highest-numbered .sqsh file
+     * (e.g. "agent_claude-code_consolidated_0000000010_X.sqsh").
+     *
+     * Security fix: empty basename → false (no fail-open via empty strpos).
+     * Correctness fix: exact leaf match (not substring) guards against prefix
+     * collisions between layers. Multi-layer lowerdir (colon-joined A:B:C) is
+     * split and each component's basename is checked individually.
+     */
+    public static function isAgentLayerLive(string $agentId, string $newestLayerBasename, string $mountsText): bool
+    {
+        if ($newestLayerBasename === '') return false;
+        $stem = (string)preg_replace('/\.sqsh$/', '', $newestLayerBasename);
+        if ($stem === '') return false;
+        $ld = self::liveAgentLowerdir($agentId, $mountsText);
+        if ($ld === null) return false;
+        foreach (explode(':', $ld) as $component) {
+            if (basename($component) === $stem) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Newest agent layer basename across both layer kinds (the persisted bake
+     * outputs), or null if none. Globs the persistence dir and delegates the
+     * chronological selection to newestAgentLayerBasename(). Layer filenames
+     * share {type}_{id}_{kind}_{seq10}_{dt}.sqsh, so a lexical sort is
+     * chronological across both the post-bake and delta-fallback kinds.
+     */
+    public static function newestAgentLayer(string $agentId, string $persistDir): ?string
+    {
+        $safe = preg_replace('/[^A-Za-z0-9._-]/', '', $agentId);
+        $glob = array_merge(
+            glob("$persistDir/agent_{$safe}_consolidated_*.sqsh") ?: [],
+            glob("$persistDir/agent_{$safe}_delta_*.sqsh") ?: []
+        );
+        return self::newestAgentLayerBasename($glob);
+    }
+
+    /**
+     * Returns the basename of the newest agent layer file across all layer kinds
+     * (post-bake and delta-fallback), or null if none found.
+     *
+     * Layer filenames share the format {type}_{id}_{kind}_{seq10}_{dt}.sqsh
+     * where seq10 is a zero-padded 10-digit monotonic sequence number
+     * (primary sort key) and dt is a UTC ISO 8601 basic timestamp (secondary
+     * tiebreak). Lexical sort is therefore chronological; newest wins.
+     *
+     * @param array<string> $globResults Absolute or relative paths from glob().
+     */
+    public static function newestAgentLayerBasename(array $globResults): ?string
+    {
+        if (empty($globResults)) {
+            return null;
+        }
+        sort($globResults);
+        return basename(end($globResults));
+    }
+
+    /**
+     * Force a deferred agent overlay refresh now that sessions are closed.
+     * Routes through FileStorage::forceRemount (the force-remount facade) so
+     * storagectl is invoked via the canonical path — never called directly
+     * (Epic #1310). Unlike ensureReady, forceRemount bypasses the
+     * isAgentMountHealthy fast-path that would silently keep a stale lowerdir;
+     * it unconditionally dispatches op_mount to swap in the newest baked layer.
+     * Returns true when storagectl exits usably (exit 0 or 2).
+     */
+    public static function forceAgentRefresh(string $agentId): bool
+    {
+        return FileStorage::forceRemount("agent/$agentId");
+    }
+
+    // -------------------------------------------------------------------------
 
     /**
      * Updates the Unraid Tasks menu visibility.

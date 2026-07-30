@@ -12,6 +12,9 @@ namespace AICliAgents\Services;
 
 class AutoLaunchService
 {
+    private const RESTART_STATE_FILE = '/tmp/unraid-aicliagents/autolaunch-restart-state.json';
+    private const MISSING_GRACE_SECONDS = 10;
+
     /**
      * Launch every flagged workspace whose agent is installed and whose
      * session is not already running.
@@ -30,7 +33,7 @@ class AutoLaunchService
      *                               actually fired in production.
      * @return array{launched:int, skipped:int, failed:int, sessions:array}
      */
-    public static function launchAllPending(?string $filterAgentId = null, string $reason = 'unknown'): array
+    public static function launchAllPending(?string $filterAgentId = null, string $reason = 'unknown', ?array $onlySessionIds = null): array
     {
         // Bug #532: serialise concurrent sweeps. PLG INLINE / disks_mounted /
         // InitService boot-marker can all fire within the same ~50 ms window
@@ -82,9 +85,16 @@ class AutoLaunchService
                 $skipped++;
                 continue;
             }
+            if ($onlySessionIds !== null && !in_array($sid, $onlySessionIds, true)) {
+                $skipped++;
+                continue;
+            }
 
             try {
-                $config = ConfigService::getAutoLaunch($path, $agentId);
+                // R-C2: select by the AGENT-LEVEL flag. Every workspace whose
+                // agent has auto-launch enabled is (re)launched, regardless of any
+                // legacy per-workspace flag — that is the agent-level intent.
+                $config = ConfigService::getAgentAutoLaunch($agentId);
                 if (!$config['autoLaunch']) {
                     $skipped++;
                     continue;
@@ -101,6 +111,15 @@ class AutoLaunchService
                     continue;
                 }
 
+                // Issue #56: an array-start/page-load race can run this sweep
+                // while /mnt/user is still an unmounted rootfs directory. Skip
+                // cleanly; a later array-start or access sweep will retry.
+                if (!StorageMountService::isPathAvailable($path)) {
+                    $skipped++;
+                    self::log("Auto-launch deferred for $sid ($agentId): workspace storage unavailable (trigger=$reason)", AICLI_LOG_WARN);
+                    continue;
+                }
+
                 $resumeId = ConfigService::getResumeId($path, $agentId);
                 if ($resumeId === null && !$config['freshIfNoResume']) {
                     $skipped++;
@@ -110,11 +129,40 @@ class AutoLaunchService
                 $chatId = $resumeId !== null ? 'auto' : '';
                 self::log("Auto-launching workspace $sid for $agentId (trigger=$reason)", AICLI_LOG_INFO);
                 TerminalService::startTerminal($sid, $path, $chatId, $agentId);
+
+                // T-10 (ACTIVITY_TRAY.md): startTerminal reports its own failures by
+                // returning silently (mount/ttyd errors don't throw), so verify the
+                // session actually came up. On failure, surface a recoverable
+                // `type:start` activity — the tray's "Retry" button re-runs JUST
+                // this workspace via the retry_auto_launch action.
+                //
+                // R-B3 (CLAUDE_RELAUNCH_SURVIVAL): isRunning now requires the AGENT
+                // to be up — a live detached tmux session for this sid — not merely
+                // "ttyd exists". A headless relaunch that brought up ttyd but no
+                // agent (the old Bug #1067 failure mode) now correctly reports
+                // failed here instead of falsely succeeding.
+                if (!ProcessManager::isRunning($sid)) {
+                    $failed++;
+                    self::log("Auto-launch failed for $sid ($agentId): session did not start (trigger=$reason)", AICLI_LOG_WARN);
+                    ActivityService::fail("start_$sid", "Auto-launch failed: session did not start", 'retry', [
+                        'type'  => 'start',
+                        'label' => "Auto-launch $agentId",
+                        'meta'  => ['sessionId' => $sid, 'agentId' => $agentId, 'path' => $path, 'chatId' => $chatId],
+                    ]);
+                    continue;
+                }
+
                 $launched++;
                 $started[] = ['id' => $sid, 'agentId' => $agentId, 'path' => $path];
             } catch (\Throwable $e) {
                 $failed++;
                 self::log("Auto-launch failed for $sid ($agentId): " . $e->getMessage(), AICLI_LOG_WARN);
+                // T-10: same recoverable activity for the exception path.
+                ActivityService::fail("start_$sid", "Auto-launch failed: " . $e->getMessage(), 'retry', [
+                    'type'  => 'start',
+                    'label' => "Auto-launch $agentId",
+                    'meta'  => ['sessionId' => $sid, 'agentId' => $agentId, 'path' => $path, 'chatId' => (isset($resumeId) && $resumeId !== null) ? 'auto' : ''],
+                ]);
             }
         }
 
@@ -133,6 +181,97 @@ class AutoLaunchService
             'failed'   => $failed,
             'sessions' => $started,
         ];
+    }
+
+    /** Bounded crash-loop delay. Public so the policy is regression-testable. */
+    public static function restartDelaySeconds(int $failedAttempts): int
+    {
+        $schedule = [10, 30, 60, 120, 300];
+        $index = max(0, min(count($schedule) - 1, $failedAttempts - 1));
+        return $schedule[$index];
+    }
+
+    /**
+     * Headless reconciliation for saved workspaces whose agent process died.
+     * The first missing observation only arms a grace timer; later observations
+     * launch the exact saved session and apply bounded backoff after failures.
+     */
+    public static function reconcileDeadWorkspaces(?int $now = null): array
+    {
+        $now = $now ?? time();
+        $state = [];
+        if (is_file(self::RESTART_STATE_FILE)) {
+            $decoded = json_decode((string)@file_get_contents(self::RESTART_STATE_FILE), true);
+            if (is_array($decoded)) $state = $decoded;
+        }
+
+        try {
+            $sessions = ConfigService::getWorkspaces()['sessions'] ?? [];
+        } catch (\Throwable $e) {
+            self::log('Crash reconciliation could not read saved workspaces: ' . $e->getMessage(), AICLI_LOG_WARN);
+            return ['armed' => 0, 'attempted' => 0, 'launched' => 0];
+        }
+
+        $savedIds = [];
+        $eligible = [];
+        $armed = 0;
+        foreach ($sessions as $session) {
+            $sid = (string)($session['id'] ?? '');
+            $agentId = (string)($session['agentId'] ?? '');
+            $path = (string)($session['path'] ?? '');
+            if ($sid === '' || $agentId === '' || $path === '') continue;
+            $savedIds[$sid] = true;
+
+            $config = ConfigService::getAgentAutoLaunch($agentId);
+            if (!$config['autoLaunch'] || ProcessManager::isRunning($sid) || self::upgradeOwnsRelaunch($agentId)) {
+                unset($state[$sid]);
+                continue;
+            }
+
+            if (!isset($state[$sid]) || !is_array($state[$sid])) {
+                $state[$sid] = ['first_missing_at' => $now, 'failures' => 0, 'next_attempt_at' => $now + self::MISSING_GRACE_SECONDS];
+                $armed++;
+                continue;
+            }
+            if ($now < (int)($state[$sid]['next_attempt_at'] ?? 0)) continue;
+            $eligible[] = $sid;
+        }
+
+        // Intentional drawer closes disappear from workspaces.json. Purging them
+        // here guarantees they can never be resurrected from stale retry state.
+        foreach (array_keys($state) as $sid) {
+            if (!isset($savedIds[$sid])) unset($state[$sid]);
+        }
+
+        $launched = 0;
+        if ($eligible !== []) {
+            self::launchAllPending(null, 'supervisor_crash_reconcile', $eligible);
+            foreach ($eligible as $sid) {
+                if (ProcessManager::isRunning($sid)) {
+                    unset($state[$sid]);
+                    $launched++;
+                    continue;
+                }
+                $failures = (int)($state[$sid]['failures'] ?? 0) + 1;
+                $state[$sid]['failures'] = $failures;
+                $state[$sid]['next_attempt_at'] = $now + self::restartDelaySeconds($failures);
+            }
+        }
+
+        AtomicWriteService::writeJson(self::RESTART_STATE_FILE, $state);
+        return ['armed' => $armed, 'attempted' => count($eligible), 'launched' => $launched];
+    }
+
+    /** Upgrades own stop/relaunch while any queue, install or activation marker exists. */
+    private static function upgradeOwnsRelaunch(string $agentId): bool
+    {
+        $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $agentId);
+        if (is_file("/tmp/unraid-aicliagents/pending-agent-upgrade-$safe.json")) return true;
+        if (is_file("/tmp/unraid-aicliagents/queued-agent-upgrade-$safe.json")) return true;
+        $statusFile = "/tmp/unraid-aicliagents/install-status-$safe";
+        if (!is_file($statusFile)) return false;
+        $status = json_decode((string)@file_get_contents($statusFile), true);
+        return is_array($status) && empty($status['completed']);
     }
 
     private static function log(string $msg, int $level): void

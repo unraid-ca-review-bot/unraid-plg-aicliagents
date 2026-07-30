@@ -21,8 +21,8 @@ class TmuxHandler {
         switch ($action) {
             case 'tmux_get_settings':           return self::getSettings();
             case 'tmux_save_settings':          return self::saveSettings();
-            case 'tmux_apply_settings':         return self::applySettings();
-            case 'tmux_reload_conf':            return self::reloadConf();
+            case 'tmux_apply_settings':         return self::applySettings($id);
+            case 'tmux_reload_conf':            return self::reloadConf($id);
             case 'tmux_restart_session':        return self::restartSession($id);
             // Four-tier (agent defaults vs workspace overrides) endpoints.
             case 'tmux_get_agent_defaults':     return self::getAgentDefaults();
@@ -30,6 +30,9 @@ class TmuxHandler {
             case 'tmux_get_workspace_overrides':return self::getWorkspaceOverrides();
             case 'tmux_save_workspace_overrides': return self::saveWorkspaceOverrides();
             case 'tmux_get_effective':          return self::getEffective();
+            // Per-session live ops (T-04 / T-06 — docs/specs/TERMINAL_COPY_PASTE.md).
+            case 'tmux_set_session_option':     return self::setSessionOption($id);
+            case 'tmux_paste_text':             return self::pasteText($id);
             default:                            return null;
         }
     }
@@ -39,7 +42,8 @@ class TmuxHandler {
                 'tmux_reload_conf', 'tmux_restart_session',
                 'tmux_get_agent_defaults', 'tmux_save_agent_defaults',
                 'tmux_get_workspace_overrides', 'tmux_save_workspace_overrides',
-                'tmux_get_effective'];
+                'tmux_get_effective',
+                'tmux_set_session_option', 'tmux_paste_text'];
     }
 
     private static function args() {
@@ -79,21 +83,23 @@ class TmuxHandler {
             : ['status' => 'error', 'message' => 'Failed to persist settings'];
     }
 
-    private static function applySettings() {
+    private static function applySettings($id) {
         $a = self::args();
         if (empty($a['path']) || empty($a['agentId'])) {
             return ['status' => 'error', 'message' => 'path and agentId required'];
         }
-        $r = TmuxService::applySettings($a['path'], $a['agentId']);
+        if ($id === 'default') return ['status' => 'error', 'message' => 'session id required'];
+        $r = TmuxService::applySettings($a['path'], $a['agentId'], $id);
         return ['status' => 'ok'] + $r;
     }
 
-    private static function reloadConf() {
+    private static function reloadConf($id) {
         $a = self::args();
         if (empty($a['path']) || empty($a['agentId'])) {
             return ['status' => 'error', 'message' => 'path and agentId required'];
         }
-        return TmuxService::reloadConf($a['path'], $a['agentId']);
+        if ($id === 'default') return ['status' => 'error', 'message' => 'session id required'];
+        return TmuxService::reloadConf($a['path'], $a['agentId'], $id);
     }
 
     private static function restartSession($id) {
@@ -104,6 +110,46 @@ class TmuxHandler {
         $sessionId = ($id !== 'default') ? $id : null;
         $killed = TmuxService::killSessions($agentId, $sessionId);
         return ['status' => 'ok', 'killed' => $killed];
+    }
+
+    // ---------- Per-session live ops (T-04 / T-06) ----------
+
+    /**
+     * Copy-mode toggle backend. $id is the dispatcher-validated session id.
+     * With `value` (on|off): session-scoped `set-option -t` — no -g, no JSON
+     * persistence, dies with the session. Without `value`: a READ — returns
+     * the live (inheritance-aware) value so the UI button shows real state.
+     * Settable keys are allowlisted (TmuxService::SESSION_SETTABLE_KEYS —
+     * only `mouse` for now).
+     */
+    private static function setSessionOption($id) {
+        $agentId = $_POST['agentId'] ?? $_GET['agentId'] ?? '';
+        if (empty($agentId)) return ['status' => 'error', 'message' => 'agentId required'];
+        if ($id === 'default') return ['status' => 'error', 'message' => 'session id required'];
+        $key   = $_POST['key']   ?? $_GET['key']   ?? 'mouse';
+        $value = $_POST['value'] ?? $_GET['value'] ?? '';
+        if ($value === '') {
+            return TmuxService::getSessionOption($agentId, $id, $key);
+        }
+        return TmuxService::setSessionOption($agentId, $id, $key, $value);
+    }
+
+    /**
+     * Paste clipboard text into the session (bracketed paste, 256 KB cap).
+     * `text` is accepted from POST ONLY — reading it from GET would put
+     * clipboard content into the query string and thus into nginx access
+     * logs. The content is never logged anywhere (see TmuxService::pasteText
+     * + the source-assertion guard in TmuxPasteTextTest).
+     */
+    private static function pasteText($id) {
+        $agentId = $_POST['agentId'] ?? $_GET['agentId'] ?? '';
+        if (empty($agentId)) return ['status' => 'error', 'message' => 'agentId required'];
+        if ($id === 'default') return ['status' => 'error', 'message' => 'session id required'];
+        $text = $_POST['text'] ?? null;
+        if (!is_string($text) || $text === '') {
+            return ['status' => 'error', 'message' => 'text required (POST body)'];
+        }
+        return TmuxService::pasteText($agentId, $id, $text);
     }
 
     // ---------- Four-tier endpoints ----------

@@ -8,6 +8,17 @@
  */
 ?>
 <script>
+// Top-level HTML escaper — shared by all top-level functions in this script
+// (notably consolidateStorage's calm-card dialog). NOTE: a second escapeHtml is
+// defined inside the consolidate-fail-banner IIFE below; that one is function-
+// local and shadows this only within that IIFE. This top-level copy is what
+// consolidateStorage resolves (the IIFE's is out of scope there).
+function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
 function refreshStats() {
     // Show storage unavailable banner if needed
     if (window.aicli_storage_available === false) {
@@ -19,7 +30,9 @@ function refreshStats() {
             $('#tab-storage .aicli-cards').prepend('<div id="aicli-storage-warning" style="background:rgba(234,179,8,0.12); border:1px solid #eab308; border-radius:6px; padding:10px 16px; margin-bottom:12px; display:flex; align-items:center; gap:8px; font-size:12px; color:#eab308;"><i class="fa fa-exclamation-triangle"></i> ' + msg + ' Storage operations may be limited.</div>');
         }
     }
-    $.getJSON('/plugins/unraid-aicliagents/AICliAjax.php?action=get_storage_status&csrf_token=' + csrf, function(data) {
+    // R-06: routed through aicliAjax (CommonLogging.php) so this high-traffic
+    // poll carries an X-Aicli-Trace id — its server/shell log lines join up.
+    aicliAjax('get_storage_status', {}, function(data) {
         if (data.migration_in_progress) {
             $('#migration-overlay').css('display', 'flex');
             if (data.migration_progress) {
@@ -147,11 +160,20 @@ function renderHomeStats(homes) {
                     '<div class="stat-bar-wrap" style="height:12px; opacity:' + (h.mounted ? 1 : 0.3) + ';"><div class="stat-bar-base" style="width:' + (100 - h.percent) + '%;"></div><div class="stat-bar-dirty" style="width:' + h.percent + '%;"></div><div class="stat-bar-text">' + (h.mounted ? (h.percent > 0 ? h.percent + '% Uncommitted' : 'Synced') : 'OFFLINE') + '</div></div>' +
                     '<div class="se-mount-label"><i class="fa fa-hdd-o"></i> ' + h.mount_point + '</div>' +
                     renderLayerList(h.layer_files, h.dirty_mb) +
+                    // Bug #1380: non-modal relocation offer — shown ONLY when this
+                    // entity's data sits on a GENUINE USB flash drive AND a durable
+                    // non-array non-flash target exists to move it to.
+                    (h.can_graduate ?
+                        '<div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px; padding:6px 8px; background:rgba(76,175,80,0.08); border:1px solid rgba(76,175,80,0.35); border-radius:4px;">' +
+                            '<span style="font-size:10px; line-height:1.4;"><i class="fa fa-hdd-o" style="color:#4caf50; margin-right:5px;"></i>This data is on a USB flash drive — move it to a durable disk (faster, no USB wear)</span>' +
+                            '<button type="button" class="aicli-btn-slim" style="background:#4caf50; white-space:nowrap;" onclick="graduateStorage(\'home\', \'' + u + '\', ' + (h.physical_mb || 0) + '); return false;">Move off USB flash drive</button>' +
+                        '</div>' : '') +
                 '</div>' +
                 '<div class="se-actions">' +
                     '<a href="#" class="stat-icon-btn" onclick="persistEntity(\'home\', \'' + u + '\'); return false;" title="Persist to storage"><i class="fa fa-save"></i></a>' +
                     '<a href="#" class="stat-icon-btn" ' + (canConsolidate ? '' : 'style="opacity:0.3; cursor:default;"') + ' onclick="' + (canConsolidate ? 'consolidateStorage(\'home\', \'' + u + '\')' : 'return false;') + '; return false;" title="' + (canConsolidate ? 'Consolidate Layers' : 'Requires 2+ layers') + '"><i class="fa fa-compress"></i></a>' +
                     '<a href="#" class="stat-icon-btn" onclick="repairStorage(\'home\', \'' + u + '\'); return false;" title="Repair Mount"><i class="fa fa-wrench"></i></a>' +
+                    '<a href="#" class="stat-icon-btn" onclick="deleteHomeStorage(\'' + u + '\'); return false;" title="Delete home data (permanent)" style="color:#c0392b;"><i class="fa fa-trash-o"></i></a>' +
                 '</div>' +
                 '</div>';
         });
@@ -207,19 +229,30 @@ function persistEntity(type, id) {
         const token = typeof csrf !== 'undefined' ? csrf : (window.csrf_token || '');
         aicli_log_to_server("User requested manual " + type + " persistence for " + id, 2);
         
-        let url = '/plugins/unraid-aicliagents/AICliAjax.php?action=persist_home&csrf_token=' + token;
-        if (type === 'agent') {
-            url = '/plugins/unraid-aicliagents/AICliAjax.php?action=persist_agent&id=' + id + '&csrf_token=' + token;
-        }
-        
-        $.getJSON(url, function(r) {
-            if (r && r.status === 'ok') { 
+        // R-06: aicliAjax stamps the X-Aicli-Trace header — this is the canonical
+        // AJAX→PHP→shell mutation path the trace id is designed to join.
+        const req = (type === 'agent')
+            ? aicliAjax('persist_agent', { id: id })
+            : aicliAjax('persist_home', {});
+        // R2 (HOME_PERSIST_PILL_AND_FEEDBACK): never leave the spinner frozen.
+        req.fail(function() {
+            swal("Persistence Failed", "The request did not complete. Check debug.log / network.", "error");
+        });
+        req.done(function(r) {
+            if (r && r.status === 'ok' && r.baking && r.job_id) {
+                // Queued path (home persist + agent persist): hand off to the activity tray.
+                swal({ title: "Queued", text: "Queued — watch the activity tray for progress.", type: "info", timer: 2500, showConfirmButton: false });
+                clearChanged();
+                refreshStats();
+            } else if (r && r.status === 'ok') {
+                // Legacy synchronous path (no baking flag) — still used for edge cases.
                 swal({ title: "Persisted", text: "Data persisted.", type: "success", timer: 2000, showConfirmButton: false });
                 clearChanged();
-                refreshStats(); 
-            }
-            else {
-                const err = r.message || "Unknown Error. Check debug.log";
+                refreshStats();
+            } else if (r && r.status === 'busy') {
+                swal({ title: "Busy", text: r.message || "Another operation is in progress. Please wait and try again.", type: "warning", showConfirmButton: true });
+            } else {
+                const err = (r && r.message) || "Unknown Error. Check debug.log";
                 aicli_log_to_server("Manual persistence FAILED: " + err, 0);
                 swal("Persistence Failed", err, "error");
             }
@@ -231,7 +264,7 @@ function persistEntity(type, id) {
 function repairStorage(type, id) {
     swal({ title: "Repair " + type + " storage?", text: "Unmount and remount the OverlayFS stack for " + id + ". This may briefly interrupt active sessions.", type: "warning", showCancelButton: true, confirmButtonText: "Repair", showLoaderOnConfirm: true, closeOnConfirm: false }, function() {
         const action = (type === 'agent') ? 'repair_agent_storage' : 'repair_home_storage';
-        $.getJSON('/plugins/unraid-aicliagents/AICliAjax.php?action=' + action + '&id=' + id + '&csrf_token=' + csrf, function(r) {
+        aicliAjax(action, { id: id }, function(r) {
             if (r.status === 'ok') swal({ title: "Repaired", text: "Storage stack remounted.", type: "success", timer: 1500, showConfirmButton: false });
             else swal("Repair Failed", r.message, "error");
             refreshStats();
@@ -240,21 +273,231 @@ function repairStorage(type, id) {
 }
 
 function consolidateStorage(type, id) {
-    swal({ title: "Consolidate " + type + " layers?", text: "Merge SquashFS deltas into a single base volume. This saves memory.", type: "warning", showCancelButton: true, showLoaderOnConfirm: true, closeOnConfirm: false }, function() {
-        $.getJSON('/plugins/unraid-aicliagents/AICliAjax.php?action=consolidate_storage&type=' + type + '&id=' + id + '&csrf_token=' + csrf, function(r) {
-            if (r.status === 'ok') {
-                swal({ title: "Consolidated", type: "success", timer: 1500 });
+    // Runs the consolidate AJAX + reports the result. No confirm of its own — the
+    // caller is responsible for confirming first (a plain confirm for agents/empty
+    // homes via doConsolidate, or the calm action-card for homes with open sessions).
+    // Shared so neither path chains two swals (sweet-alert v1 swallows a new swal
+    // opened from a closeOnConfirm:true callback — that was the "overlay disappears,
+    // nothing happens" bug).
+
+    // R2.3 — backend now returns {status:'queued', job_id, message} almost immediately.
+    // On queued: close the dialog at once; the activity-tray pill is the progress source
+    // of truth. A brief non-blocking toast confirms the hand-off. On any non-queued
+    // response keep the error path.
+    function runConsolidate() {
+        aicliAjax('consolidate_storage', { type: type, id: id }, function(r) {
+            if (r && r.status === 'queued') {
+                // Hand off to the activity tray immediately — no long spin.
+                swal({
+                    title: 'Consolidating ' + id + '’s home',
+                    text: r.message || 'Queued — watch the activity tray for progress.',
+                    type: 'info',
+                    timer: 2500,
+                    showConfirmButton: false
+                });
                 clearChanged();
+            } else if (r && r.status === 'ok') {
+                // Non-home consolidate (agent) or legacy synchronous path — truthful.
+                swal({ title: "Queued", text: r.message || 'Consolidation queued.', type: 'info', timer: 4000, showConfirmButton: false });
+                clearChanged();
+            } else {
+                swal('Failed', (r && r.message) || 'Unknown error. Check debug.log.', 'error');
             }
-            else swal("Failed", r.message, "error");
             refreshStats();
+        });
+    }
+
+    function doConsolidate() {
+        swal({ title: 'Consolidate ' + type + ' layers?', text: 'Merge SquashFS deltas into a single base volume. This saves memory.', type: 'warning', showCancelButton: true, showLoaderOnConfirm: true, closeOnConfirm: false }, function(confirmed) {
+            if (!confirmed) return;
+            runConsolidate();
+        });
+    }
+
+    if (type !== 'home') {
+        doConsolidate();
+        return;
+    }
+
+    // R1.2/R1.3 — For home consolidates: fetch open sessions first.
+    // If sessions exist, show a calm action-card (NOT a destructive warning) because
+    // the operation auto-resumes every session — it is safe and reversible.
+    // If sessions is empty, fall back to the standard doConsolidate confirm.
+    aicliAjax('get_home_sessions', { id: id }, function(r) {
+        var sessions = (r && r.status === 'ok' && r.sessions) ? r.sessions : [];
+        if (sessions.length === 0) {
+            doConsolidate();
+            return;
+        }
+
+        // Build agent-row grid. Each session: {id, agentId, name, icon, path, workspace}.
+        // Fall back defensively: name → agentId → 'unknown'; icon → generic SVG data-uri.
+        var FALLBACK_ICON = 'data:image/svg+xml,%3Csvg xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22 viewBox%3D%220 0 24 24%22 fill%3D%22none%22 stroke%3D%22%23888%22 stroke-width%3D%221.5%22%3E%3Crect x%3D%223%22 y%3D%223%22 width%3D%2218%22 height%3D%2218%22 rx%3D%223%22%2F%3E%3Ccircle cx%3D%2212%22 cy%3D%229%22 r%3D%222.5%22%2F%3E%3Cpath d%3D%22M7 19c0-2.8 2.2-5 5-5s5 2.2 5 5%22%2F%3E%3C%2Fsvg%3E';
+
+        // Determine shared workspace path (shown once if all sessions share the same path).
+        var paths = sessions.map(function(s) { return s.workspace || s.path || ''; });
+        var firstPath = paths[0] || '';
+        var sharedPath = firstPath && paths.every(function(p) { return p === firstPath; }) ? firstPath : '';
+
+        var rowsHtml = '';
+        for (var i = 0; i < sessions.length; i++) {
+            var s = sessions[i];
+            var displayName = s.name || s.agentId || 'unknown';
+            var iconSrc = s.icon || FALLBACK_ICON;
+            // XSS-safe icon src: only image data URIs, https, or root-relative
+            // same-origin paths (registry icons). Anything else -> fallback.
+            if (!/^(data:image\/|https:\/\/|\/[^\/])/.test(iconSrc)) { iconSrc = FALLBACK_ICON; }
+            var rowPath = s.workspace || s.path;
+            var pathHtml = (!sharedPath && rowPath)
+                ? '<span style="display:block; font-size:10px; font-family:monospace; opacity:0.55; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:160px;">' + escapeHtml(rowPath) + '</span>'
+                : '';
+            rowsHtml +=
+                '<div style="display:flex; align-items:center; gap:8px; padding:5px 6px; border-radius:4px; background:var(--mild-background-color,rgba(0,0,0,0.04));">' +
+                    '<img src="' + escapeHtml(iconSrc) + '" alt="" style="width:22px; height:22px; border-radius:4px; flex-shrink:0; object-fit:contain; background:var(--title-header-background-color,#333);" onerror="this.src=\'' + FALLBACK_ICON + '\'">' +
+                    '<div style="min-width:0; flex:1;">' +
+                        '<span style="font-size:12px; font-weight:600; color:var(--text-color,#eee);">' + escapeHtml(displayName) + '</span>' +
+                        pathHtml +
+                    '</div>' +
+                '</div>';
+        }
+
+        var sharedPathHtml = sharedPath
+            ? '<div style="margin-top:8px; padding:5px 8px; border-radius:4px; background:var(--mild-background-color,rgba(0,0,0,0.04)); font-family:monospace; font-size:10px; color:var(--text-color,#ccc); opacity:0.75; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' +
+                  '<svg style="width:12px;height:12px;vertical-align:-2px;margin-right:4px;" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 10l4-4 3 3 5-5"/><path d="M1 13h14"/></svg>' +
+                  escapeHtml(sharedPath) +
+              '</div>'
+            : '';
+
+        // Merge/consolidate SVG icon — two overlapping layers flowing into one. No emoji.
+        var mergeIconSvg =
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" ' +
+                'style="width:52px;height:52px;display:block;margin:0 auto 8px;" ' +
+                'aria-hidden="true">' +
+                // back layer (lighter, offset up-right)
+                '<rect x="14" y="6" width="26" height="18" rx="3" ' +
+                    'stroke="var(--orange,#e68a00)" stroke-width="1.8" stroke-dasharray="3 2" opacity="0.45"/>' +
+                // front layer (solid, offset down-left)
+                '<rect x="8" y="14" width="26" height="18" rx="3" ' +
+                    'stroke="var(--orange,#e68a00)" stroke-width="1.8" opacity="0.7"/>' +
+                // merge arrow pointing down to unified layer
+                '<path d="M24 32 L24 38" stroke="var(--orange,#e68a00)" stroke-width="2" stroke-linecap="round"/>' +
+                '<path d="M20 35 L24 39 L28 35" stroke="var(--orange,#e68a00)" stroke-width="2" ' +
+                    'stroke-linecap="round" stroke-linejoin="round"/>' +
+                // unified bottom layer
+                '<rect x="11" y="39" width="26" height="4" rx="2" ' +
+                    'fill="var(--orange,#e68a00)" opacity="0.85"/>' +
+            '</svg>';
+
+        var cardHtml =
+            '<div style="text-align:center; padding:4px 0 8px;">' +
+                mergeIconSvg +
+                '<div style="font-size:11px; line-height:1.5; color:var(--text-color,#ccc); opacity:0.85; margin-bottom:12px; padding:0 4px;">' +
+                    'Frees memory by merging storage layers. Your sessions close briefly and reopen exactly where you left off.' +
+                '</div>' +
+                '<div style="display:grid; grid-template-columns:1fr 1fr; gap:5px; text-align:left; margin-bottom:0;">' +
+                    rowsHtml +
+                '</div>' +
+                sharedPathHtml +
+            '</div>';
+
+        // R1.2: calm swal — no "warning" type icon. html:true, closeOnConfirm:false keeps
+        // the modal up while the brief AJAX round-trip completes (showLoaderOnConfirm).
+        // Sweet-alert v1 note: do NOT open a new swal from a closeOnConfirm:true callback
+        // — it gets swallowed. closeOnConfirm:false + runConsolidate's own swal replaces it.
+        swal({
+            title: 'Consolidate ' + id + '’s home',
+            text: cardHtml,
+            html: true,
+            type: 'info',
+            showCancelButton: true,
+            confirmButtonText: 'Consolidate',
+            cancelButtonText: 'Cancel',
+            showLoaderOnConfirm: true,
+            closeOnConfirm: false
+        }, function(confirmed) {
+            if (!confirmed) return;
+            runConsolidate();
+        });
+    });
+}
+
+// Bug #1380: "Move off USB flash drive" — relocate an entity's data from a
+// genuine USB-flash persist device to a durable non-array non-flash target the
+// user picks. Lists the QUALIFYING targets (the same filtered list the offer
+// gate uses), then drives the proven relocation (execute_migrate: verified
+// per-file copy + config + manifest re-point under a crash-safe marker).
+function graduateStorage(type, id, physicalMb) {
+    const mb = parseFloat(physicalMb) || 0;
+    function fmtBytes(b) {
+        b = parseFloat(b) || 0;
+        if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GB free';
+        if (b >= 1048576)    return (b / 1048576).toFixed(0) + ' MB free';
+        return 'free space unknown';
+    }
+    // Step 1: fetch the qualifying durable targets for this kind.
+    aicliAjax('graduate_targets', { type: type }, function(tr) {
+        if (!tr || tr.status !== 'ok') {
+            swal("Couldn't list targets", (tr && tr.message) || "Unknown error. Check debug.log.", "error");
+            return;
+        }
+        var targets = tr.targets || [];
+        if (targets.length === 0) {
+            swal("No durable target available",
+                 "There is no durable, non-array, non-flash location to move this data to. Add a pool or an Unassigned Device, then try again.",
+                 "info");
+            return;
+        }
+        // Step 2: build a radio picker of the qualifying targets.
+        var opts = '';
+        $.each(targets, function(i, t) {
+            var checked = (i === 0) ? ' checked' : '';
+            var sub = (t.label ? t.label : t.path) + ' — ' + fmtBytes(t.free_bytes);
+            opts += '<label style="display:flex; align-items:flex-start; gap:8px; padding:6px 4px; cursor:pointer; text-align:left;">' +
+                        '<input type="radio" name="aicli-grad-target" value="' + String(t.path).replace(/"/g, '&quot;') + '"' + checked + ' style="margin-top:3px;">' +
+                        '<span style="font-size:12px; line-height:1.4;"><strong>' + sub + '</strong>' +
+                        '<br><span style="font-family:monospace; font-size:10px; opacity:0.65;">' + t.path + '</span></span>' +
+                    '</label>';
+        });
+        // Rough wall-clock estimate: decompress + verified copy ≈ 2 min/GB, min 2 min.
+        var estMin = Math.max(2, Math.round((mb / 1024) * 2));
+        var html =
+            '<div style="text-align:left; font-size:12px; line-height:1.5;">' +
+                '<p>This home\'s data is on a USB flash drive. Pick a durable disk to move it to — the layers are copied and verified before anything on the stick is touched, then the persistence path is switched.</p>' +
+                '<div style="border:1px solid var(--border-color,#ddd); border-radius:4px; padding:4px 8px; margin:8px 0; max-height:180px; overflow-y:auto;">' + opts + '</div>' +
+                '<p style="font-size:11px; opacity:0.7;">Estimated time: ~' + estMin + ' min. Close any terminals for this user first or the copy will wait for the mount to go idle.</p>' +
+            '</div>';
+        swal({
+            title: "Move " + id + " off the USB flash drive",
+            text: html,
+            html: true,
+            type: "info",
+            showCancelButton: true,
+            confirmButtonText: "Move data",
+            showLoaderOnConfirm: true,
+            closeOnConfirm: false
+        }, function(confirmed) {
+            if (confirmed === false) return;
+            var chosen = $('input[name="aicli-grad-target"]:checked').val();
+            if (!chosen) {
+                swal.showInputError && swal.showInputError("Pick a target disk.");
+                return false;
+            }
+            aicli_log_to_server("User requested move-off-USB for " + type + "/" + id + " → " + chosen, 2);
+            aicliAjax('graduate_storage', { type: type, target: chosen }, function(r) {
+                if (r && r.status === 'ok') {
+                    swal({ title: "Move started", text: "The data is being copied and verified, then the path is switched. Watch progress on this tab.", type: "success", timer: 4000, showConfirmButton: false });
+                } else {
+                    swal("Move failed", (r && r.message) || "Unknown error. Check debug.log.", "error");
+                }
+                refreshStats();
+            });
         });
     });
 }
 
 function wipeStorage(type, id) {
     swal({ title: "Wipe Storage: " + id + "?", text: "PERMANENTLY WIPE all storage for this " + type + ". This cannot be undone.", type: "error", showCancelButton: true, confirmButtonColor: "#f44336", confirmButtonText: "YES, WIPE IT", showLoaderOnConfirm: true, closeOnConfirm: false }, function() {
-        $.getJSON('/plugins/unraid-aicliagents/AICliAjax.php?action=wipe_storage&type=' + type + '&id=' + id + '&csrf_token=' + csrf, function(r) {
+        aicliAjax('wipe_storage', { type: type, id: id }, function(r) {
             if (r.status === 'ok') {
                 swal({ title: "Wiped", type: "success", timer: 1500 });
                 clearChanged();
@@ -266,6 +509,63 @@ function wipeStorage(type, id) {
 }
 // Legacy alias for backwards compatibility
 function nuclearRebuild(type, id) { wipeStorage(type, id); }
+
+// Bug #1379: permanently delete a home entity and ALL its layers.
+// "root" and "aicliagent" require typed confirmation (they are the primary homes).
+// All other homes get a single-confirm swal.
+function deleteHomeStorage(id) {
+    var isRoot = (id === 'root' || id === 'aicliagent');
+
+    if (isRoot) {
+        // Extra-stern typed confirmation for the primary home.
+        swal({
+            title: 'Delete home data for \'' + id + '\'?',
+            text: 'This is the primary user home — all stored layers, settings and session data for \'' + id + '\' will be permanently destroyed.\n\nType DELETE in the box below to confirm.',
+            type: 'input',
+            inputPlaceholder: 'Type DELETE to confirm',
+            showCancelButton: true,
+            closeOnConfirm: false,
+            animation: 'slide-from-top',
+            confirmButtonColor: '#c0392b',
+            confirmButtonText: 'Delete permanently'
+        }, function(inputValue) {
+            if (inputValue === false) return;
+            if (inputValue !== 'DELETE') {
+                swal.showInputError('Type DELETE exactly (uppercase) to confirm — or Cancel to back out.');
+                return false;
+            }
+            aicliAjax('delete_home_storage', { id: id, root_confirmed: '1' }, function(r) {
+                if (r && r.status === 'ok') {
+                    swal({ title: 'Deleted', text: r.message || 'Home storage deleted.', type: 'success', timer: 2500, showConfirmButton: false });
+                    refreshStats();
+                } else {
+                    swal('Delete Failed', (r && r.message) || 'Unknown error. Check debug.log.', 'error');
+                }
+            });
+        });
+    } else {
+        // Single-confirm for non-root homes.
+        swal({
+            title: 'Delete home data for \'' + id + '\'?',
+            text: 'This permanently removes all stored layers and session data for \'' + id + '\'. This cannot be undone.',
+            type: 'warning',
+            showCancelButton: true,
+            confirmButtonColor: '#c0392b',
+            confirmButtonText: 'Delete permanently',
+            showLoaderOnConfirm: true,
+            closeOnConfirm: false
+        }, function() {
+            aicliAjax('delete_home_storage', { id: id }, function(r) {
+                if (r && r.status === 'ok') {
+                    swal({ title: 'Deleted', text: r.message || 'Home storage deleted.', type: 'success', timer: 2500, showConfirmButton: false });
+                    refreshStats();
+                } else {
+                    swal('Delete Failed', (r && r.message) || 'Unknown error. Check debug.log.', 'error');
+                }
+            });
+        });
+    }
+}
 
 // ---- Phase 0 + 4a: Boot Integrity Banner with Sibling-Restore ----
 // Fetches the boot integrity status once when the storage tab is opened.

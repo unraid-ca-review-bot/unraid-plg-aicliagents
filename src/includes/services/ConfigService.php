@@ -34,6 +34,11 @@ class ConfigService {
             'enable_tab' => '1',
             'version_check_schedule' => '0 6 * * *',
             'version_check_months' => '3',
+            // R-09 (Feature #1372): plugin health check cron — empty disables.
+            'health_check_schedule' => '*/30 * * * *',
+            // T-08 follow-on (ACTIVITY_TRAY.md): per-session graceful-close poll
+            // budget in seconds. Default matches the historical hardcoded 3s.
+            'graceful_close_timeout' => '3',
             // Storage Durability Supervisor (Phase 3)
             'supervisor_enabled'                => '1',
             'supervisor_tick_seconds'           => '5',
@@ -59,10 +64,23 @@ class ConfigService {
             // Default + bounds measured Phase 0.2 — see PHASE5_STORAGECTL_DISPATCHER.md.
             'consolidate_max_layers'            => '30',
             'emergency_bake_compression'        => 'lz4',
+            // S-08 (#1353, STORAGE_ASYNC_JOBS.md): total wall-clock budget for a
+            // deferred mount job's supervisor requeue-with-backoff (10→30→60 s)
+            // before it fails + notifies. Covers UD devices mounting up to ~2 min
+            // after array start.
+            'storage_target_wait_s'             => '300',
             // Boot Integrity (Phase 4b)
             'boot_integrity_strict'             => '1',
             'verify_sha256_on_boot'             => '0',
             'lifecycle_log_max_bytes'           => '1048576',
+            // R-05/R-07 (Feature #1370): debug.log rotation bound (tmpfs RAM
+            // pressure, 1 kept generation) + structured format (text | jsonl).
+            'debug_log_max_bytes'               => '5242880',
+            'debug_log_format'                  => 'text',
+            // T-12 (FIRST_RUN_WIZARD.md): empty = wizard not yet completed.
+            // Set to 'yes' by the React wizard via the `save` action on completion.
+            // No UI toggle — the wizard is deliberately one-shot.
+            'first_run_done'                       => '',
             // Bug #537: array-stop / shutdown supervisor flush budget. Default
             // 60 s. Lift to 120-300 s if you have 100+ entities or run on slow
             // USB / contended memory.
@@ -127,6 +145,7 @@ class ConfigService {
         $oldHomePath = $config['home_storage_path'] ?? "/boot/config/plugins/unraid-aicliagents/persistence";
         $newHomePath = $newConfig['home_storage_path'] ?? $oldHomePath;
         $oldVersionSchedule = $config['version_check_schedule'] ?? '0 6 * * *';
+        $oldHealthSchedule  = $config['health_check_schedule'] ?? '*/30 * * * *';
 
         $changedKeys = [];
         foreach ($newConfig as $key => $val) {
@@ -167,6 +186,12 @@ class ConfigService {
             self::updateVersionCheckCron($newSchedule);
         }
 
+        // R-09: update cron job if health check schedule changed
+        $newHealthSchedule = $config['health_check_schedule'] ?? '';
+        if ($newHealthSchedule !== $oldHealthSchedule) {
+            self::updateHealthCheckCron($newHealthSchedule);
+        }
+
         return true;
     }
 
@@ -186,6 +211,25 @@ class ConfigService {
         }
         exec("/usr/local/sbin/update_cron 2>/dev/null");
         LogService::log("Version check cron updated: " . ($schedule ?: 'disabled'), LogService::LOG_INFO, "ConfigService");
+    }
+
+    /**
+     * R-09 (Feature #1372): updates the cron job for the plugin health check.
+     * Mirrors updateVersionCheckCron — empty schedule removes the cron file.
+     */
+    public static function updateHealthCheckCron(string $schedule): void {
+        $cronFile = '/etc/cron.d/unraid-aicliagents.health-check';
+        $script = '/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/healthcheck.php';
+
+        if (empty($schedule)) {
+            // Disabled — remove cron file
+            @unlink($cronFile);
+        } else {
+            $content = "# AICliAgents: plugin health check schedule\n$schedule /usr/bin/php $script &> /dev/null\n";
+            @file_put_contents($cronFile, $content);
+        }
+        exec("/usr/local/sbin/update_cron 2>/dev/null");
+        LogService::log("Health check cron updated: " . ($schedule ?: 'disabled'), LogService::LOG_INFO, "ConfigService");
     }
 
     /**
@@ -230,7 +274,7 @@ class ConfigService {
         if (empty($user)) $user = 'root';
 
         // Ensure home is mounted so we write into the OverlayFS stack, not the underlying rootfs
-        if (!StorageMountService::ensureHomeMounted($user)) {
+        if (!FileStorage::ensureReady("home/$user")->ok) {   // Epic #1310: facade intent
             LogService::log("getUserStatePath: home mount unavailable for '$user' — reads/writes will target bare tmpfs and may be lost", LogService::LOG_WARN, "ConfigService");
         }
 
@@ -300,9 +344,14 @@ class ConfigService {
     /**
      * Saves the list of workspaces (sessions).
      */
-    public static function saveWorkspaces($data) {
+    public static function saveWorkspaces($data, array $removedIds = []) {
+        $data = self::mergeWorkspaceSnapshot(self::getWorkspaces(), $data, $removedIds);
         $count = count($data['sessions'] ?? []);
         $file = self::getUserStatePath() . "/workspaces.json";
+        if (self::workspaceDataMatchesFile($file, $data)) {
+            LogService::log("saveWorkspaces unchanged: count=$count path=$file", LogService::LOG_DEBUG, "ConfigService");
+            return true;
+        }
         // Diagnostic INFO (not DEBUG) so the boundary is visible in default-level
         // logs. A reported workspace-loss had no audit trail because the prior
         // log was DEBUG.
@@ -313,6 +362,44 @@ class ConfigService {
         }
         LogService::log("saveWorkspaces ok: count=$count path=$file", LogService::LOG_INFO, "ConfigService");
         return true;
+    }
+
+    /**
+     * Merge a browser snapshot into the server registry. Omission is not a
+     * deletion: another tab may have created that workspace after this tab
+     * loaded. Only an explicit removed id may delete a server-side row.
+     */
+    public static function mergeWorkspaceSnapshot(array $existing, array $incoming, array $removedIds = []): array {
+        $removed = array_fill_keys(array_values(array_filter($removedIds, 'is_string')), true);
+        $sessions = [];
+        foreach (($incoming['sessions'] ?? []) as $session) {
+            if (!is_array($session) || empty($session['id']) || isset($removed[$session['id']])) continue;
+            $sessions[(string)$session['id']] = $session;
+        }
+        foreach (($existing['sessions'] ?? []) as $session) {
+            if (!is_array($session) || empty($session['id'])) continue;
+            $id = (string)$session['id'];
+            if (!isset($removed[$id]) && !isset($sessions[$id])) $sessions[$id] = $session;
+        }
+        $incoming['sessions'] = array_values($sessions);
+        if (!array_key_exists('activeId', $incoming)) $incoming['activeId'] = $existing['activeId'] ?? null;
+        if ($incoming['activeId'] !== null && !isset($sessions[(string)$incoming['activeId']])) {
+            $incoming['activeId'] = $existing['activeId'] ?? (array_key_first($sessions) ?: null);
+        }
+        return $incoming;
+    }
+
+    /**
+     * Return true only when an existing, valid workspace file already contains
+     * exactly the requested state. Kept public so the no-write decision can be
+     * tested against an isolated fixture without touching a live home overlay.
+     */
+    public static function workspaceDataMatchesFile(string $file, array $data): bool {
+        if (!is_file($file)) return false;
+        $raw = @file_get_contents($file);
+        if ($raw === false || $raw === '') return false;
+        $existing = json_decode($raw, true);
+        return is_array($existing) && json_last_error() === JSON_ERROR_NONE && $existing === $data;
     }
 
     /**
@@ -438,5 +525,126 @@ class ConfigService {
     public static function clearAutoLaunch($path, $agentId): void
     {
         @unlink(self::getAutoLaunchFilePath($path, $agentId));
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent-level auto-launch preference (R-C1/R-C2, CLAUDE_RELAUNCH_SURVIVAL).
+    //
+    // Auto-launch is an AGENT-LEVEL setting: enabling it for an agent makes ALL
+    // of that agent's workspaces auto-launch/relaunch after a deploy, regardless
+    // of how many are open. This supersedes the per-(path,agent) flag above (kept
+    // only for the one-time migration; new writes go agent-scoped). Stored in a
+    // single HOME-resident map so the whole agent set is one read.
+    // -----------------------------------------------------------------------
+
+    private static function getAgentAutoLaunchFilePath(): string
+    {
+        return self::getUserStatePath() . "/autolaunch_agents.json";
+    }
+
+    /**
+     * Reads the full agent-level auto-launch map: { agentId => {autoLaunch, freshIfNoResume} }.
+     */
+    public static function getAgentAutoLaunchMap(): array
+    {
+        $file = self::getAgentAutoLaunchFilePath();
+        if (!file_exists($file)) return [];
+        $data = json_decode((string)file_get_contents($file), true);
+        return is_array($data) ? $data : [];
+    }
+
+    /**
+     * Agent-level auto-launch preference for a single agent.
+     * @return array{autoLaunch:bool, freshIfNoResume:bool}
+     */
+    public static function getAgentAutoLaunch(string $agentId): array
+    {
+        $map = self::getAgentAutoLaunchMap();
+        $entry = $map[$agentId] ?? null;
+        // #86: saved drawer workspaces are restart-enabled by default. An entry
+        // only exists when the user has made an explicit choice, so a stored
+        // false remains the opt-out while an absent row means ON.
+        if (!is_array($entry)) return ['autoLaunch' => true, 'freshIfNoResume' => true];
+        return [
+            'autoLaunch'      => !empty($entry['autoLaunch']),
+            'freshIfNoResume' => !empty($entry['freshIfNoResume']),
+        ];
+    }
+
+    /**
+     * Sets the agent-level auto-launch preference. Persists the whole map atomically.
+     */
+    public static function setAgentAutoLaunch(string $agentId, bool $autoLaunch, bool $freshIfNoResume): bool
+    {
+        if ($agentId === '') return false;
+        $map = self::getAgentAutoLaunchMap();
+        $map[$agentId] = ['autoLaunch' => $autoLaunch, 'freshIfNoResume' => $freshIfNoResume];
+        return AtomicWriteService::writeJson(self::getAgentAutoLaunchFilePath(), $map);
+    }
+
+    /**
+     * Removes the agent-level auto-launch entry for one agent. No-op if absent.
+     */
+    public static function clearAgentAutoLaunch(string $agentId): void
+    {
+        if ($agentId === '') return;
+        $map = self::getAgentAutoLaunchMap();
+        unset($map[$agentId]);
+        AtomicWriteService::writeJson(self::getAgentAutoLaunchFilePath(), $map);
+    }
+
+    /**
+     * One-time migration (R-C1): collapse per-(path,agent) auto-launch flags into
+     * the agent-level map. For each agent, if ANY workspace had auto-launch ON, the
+     * agent-level flag becomes ON (freshIfNoResume = OR of the contributing rows).
+     * Idempotent: a marker on the HOME state dir guards against re-running, and the
+     * function never downgrades an agent that is already enabled agent-level.
+     *
+     * @return bool true if the migration ran this call (false = already done / no-op marker)
+     */
+    public static function migrateAutoLaunchToAgentLevel(): bool
+    {
+        $marker = self::getUserStatePath() . "/.autolaunch_agent_migration_done";
+        if (file_exists($marker)) return false;
+
+        try {
+            $workspaces = self::getWorkspaces();
+            $sessions   = $workspaces['sessions'] ?? [];
+
+            // Aggregate per-(path,agent) flags up to the agent level.
+            $agg = self::getAgentAutoLaunchMap();
+            foreach ($sessions as $session) {
+                $path    = $session['path']    ?? '';
+                $agentId = $session['agentId'] ?? '';
+                if ($path === '' || $agentId === '') continue;
+                $legacyFile = self::getAutoLaunchFilePath($path, $agentId);
+                // Missing legacy files meant "no choice made", which now
+                // inherits the default-on policy. A present false file was an
+                // explicit user opt-out and must remain false after migration.
+                if (!file_exists($legacyFile)) continue;
+                $ws = self::getAutoLaunch($path, $agentId);
+                if (!array_key_exists($agentId, $agg)) {
+                    $agg[$agentId] = ['autoLaunch' => false, 'freshIfNoResume' => false];
+                }
+                if (empty($ws['autoLaunch'])) continue;
+                $cur = $agg[$agentId] ?? ['autoLaunch' => false, 'freshIfNoResume' => false];
+                $agg[$agentId] = [
+                    'autoLaunch'      => true,
+                    'freshIfNoResume' => !empty($cur['freshIfNoResume']) || !empty($ws['freshIfNoResume']),
+                ];
+            }
+
+            if (!empty($agg)) {
+                AtomicWriteService::writeJson(self::getAgentAutoLaunchFilePath(), $agg);
+            }
+        } catch (\Throwable $e) {
+            LogService::log("autolaunch agent-level migration failed: " . $e->getMessage(), LogService::LOG_WARN, "ConfigService");
+            // Do NOT write the marker on failure — retry next boot.
+            return false;
+        }
+
+        @touch($marker);
+        LogService::log("autolaunch migrated to agent-level map.", LogService::LOG_INFO, "ConfigService");
+        return true;
     }
 }

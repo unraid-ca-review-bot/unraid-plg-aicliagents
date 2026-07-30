@@ -80,7 +80,16 @@ class CurlInstallSource implements AgentSource {
             'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
         ];
         if (!empty($src['env']) && is_array($src['env'])) {
-            foreach ($src['env'] as $k => $v) $envPairs[] = escapeshellarg("$k=$v");
+            foreach ($src['env'] as $k => $v) {
+                // Quote the VALUE, not the whole assignment. A shell does not
+                // classify a fully-quoted `KEY=value` word as an environment
+                // assignment and instead tries to execute it as a command.
+                if (!is_string($k) || !preg_match('/^[A-Z_][A-Z0-9_]*$/', $k)) {
+                    LogService::log("CurlInstallSource: invalid source env key for $agentId", LogService::LOG_ERROR, "CurlInstallSource");
+                    return false;
+                }
+                $envPairs[] = $k . '=' . escapeshellarg((string)$v);
+            }
         }
         // WP #963: timeout guard. A hung vendor handoff (e.g. an interactive
         // `agy install` shell-config step) must not stall the install. `timeout`
@@ -199,6 +208,10 @@ class CurlInstallSource implements AgentSource {
         }
         $json = @shell_exec('curl -fsSL -m 20 ' . escapeshellarg($url) . ' 2>/dev/null');
         if (!is_string($json) || $json === '') return null;
+        if (($src['manifest_format'] ?? 'json') === 'plain') {
+            $v = trim($json);
+            return preg_match('/^v?(\d+\.\d+\.\d+(?:[-+][\w.]+)?)/', $v, $m) ? $m[1] : null;
+        }
         $data = json_decode($json, true);
         if (!is_array($data)) return null;
         $key = (string)($src['manifest_version_key'] ?? 'version');

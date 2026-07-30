@@ -59,10 +59,8 @@ function installVersionAgent(id, btn, explicitVersion) {
 }
 
 // Single consolidated confirm modal. Shows the appropriate title + body for
-// install / upgrade / downgrade / reinstall, and lists any active sessions
-// that will be gracefully closed. One modal, one user decision, one async
-// hop to the install endpoint. Keeps the close-sessions list visible so the
-// user always knows what's about to happen.
+// install / upgrade / downgrade / reinstall. With active sessions the safe
+// default queues the change; destructive force-close is an explicit opt-in.
 function _showInstallConfirm(id, version, btn, label, sessions) {
     // WP #964 (slice): an upgrade gets the richer keep-a-copy overlay — it
     // offers a rollback backup of the current version before replacing it.
@@ -88,12 +86,17 @@ function _showInstallConfirm(id, version, btn, label, sessions) {
     if (sessions.length > 0) {
         var lines = sessions.map(function(s) {
             var p = s.path || '<no workspace>';
-            return '• ' + p + '  (' + (s.id || '').slice(0, 8) + ')';
-        }).join('\n');
-        body += sessions.length + ' active session' + (sessions.length === 1 ? '' : 's')
-              + ' will be gracefully closed:\n\n' + lines
-              + "\n\nEach session's resume id is preserved so you can pick up where you left off.";
-        confirmText = 'Close & ' + (isInstall ? 'install' : label.toLowerCase());
+            return '• ' + _escAttr(p) + '  (' + _escAttr((s.id || '').slice(0, 8)) + ')';
+        }).join('<br>');
+        body = '<div style="text-align:left;line-height:1.5">'
+             + sessions.length + ' active session' + (sessions.length === 1 ? '' : 's')
+             + ' will remain running:<br>' + lines
+             + '<br><br><b>The change will queue safely and start after all sessions close naturally.</b>'
+             + '<label style="display:flex;gap:8px;align-items:flex-start;margin-top:12px;cursor:pointer">'
+             + '<input type="checkbox" id="aicli-force-upgrade" style="margin-top:2px">'
+             + '<span>Force now: terminate these sessions; background subagents, monitors, and shell tasks will stop.</span>'
+             + '</label></div>';
+        confirmText = 'Queue change safely';
     } else if (isInstall) {
         body = 'Proceed with installation.';
     }
@@ -108,13 +111,16 @@ function _showInstallConfirm(id, version, btn, label, sessions) {
     swal({
         title: title,
         text: body,
+        html: sessions.length > 0,
         type: sessions.length > 0 ? 'warning' : (label === 'Downgrade' ? 'warning' : 'info'),
         showCancelButton: true,
         confirmButtonText: confirmText,
         cancelButtonText: 'Cancel',
         closeOnConfirm: true,
     }, function(confirmed) {
-        if (confirmed) doInstall(id, version, btn, sessions.length);
+        if (!confirmed) return;
+        var force = document.getElementById('aicli-force-upgrade');
+        doInstall(id, version, btn, sessions.length, null, !!(force && force.checked));
     });
 }
 
@@ -183,6 +189,12 @@ function _aicliRenderBackupEstimate(est) {
         toggle.checked = false; toggle.disabled = true;
         return;
     }
+    if (est.storage_format === 'unavailable') {
+        note.style.color = 'var(--orange, #e68a00)';
+        note.textContent = '⚠ No persisted current installation was found to back up.';
+        toggle.checked = false; toggle.disabled = true;
+        return;
+    }
     if (!est.sufficient) {
         note.style.color = 'var(--orange, #e68a00)';
         note.textContent = '⚠ Not enough space here for a backup. You can upgrade without one, or cancel.';
@@ -232,7 +244,13 @@ function _showUpgradeBackupOverlay(id, version, btn, sessions) {
             sessionHtml =
                 '<div style="margin-bottom:10px;">'
               + sessions.length + ' active session' + (sessions.length === 1 ? '' : 's')
-              + ' will be gracefully closed:<br>' + lines + '</div>';
+              + ' will remain running:<br>' + lines
+              + '<br><b>The upgrade will queue safely and start after all sessions close naturally.</b>'
+              + '<label style="display:flex; gap:8px; align-items:flex-start; margin-top:10px; cursor:pointer;">'
+              + '<input type="checkbox" id="aicli-force-upgrade" style="margin-top:2px;">'
+              + '<span>Force now: terminate these sessions; background subagents, monitors, and shell tasks will stop.</span>'
+              + '</label>'
+              + '</div>';
         }
 
         var html =
@@ -262,13 +280,14 @@ function _showUpgradeBackupOverlay(id, version, btn, sessions) {
             text: html,
             html: true,
             showCancelButton: true,
-            confirmButtonText: sessions.length > 0 ? 'Close & upgrade' : 'Upgrade',
+            confirmButtonText: sessions.length > 0 ? 'Queue upgrade safely' : 'Upgrade',
             cancelButtonText: 'Cancel',
             closeOnConfirm: false,
         }, function(confirmed) {
             if (!confirmed) return;
             var toggle = document.getElementById('aicli-bk-toggle');
             var destEl = document.getElementById('aicli-bk-dest');
+            var forceEl = document.getElementById('aicli-force-upgrade');
             // Backup only when the toggle is both checked AND enabled — a
             // disabled toggle means insufficient space / bad path, so the
             // confirm means "upgrade without a backup".
@@ -276,8 +295,23 @@ function _showUpgradeBackupOverlay(id, version, btn, sessions) {
                 ? { backup: true, dest: (destEl ? destEl.value.trim() : '') }
                 : null;
             swal.close();
-            doInstall(id, version, btn, sessions.length, opts);
+            doInstall(id, version, btn, sessions.length, opts, !!(forceEl && forceEl.checked));
         });
+
+        // Keep the primary action honest about the selected admission mode.
+        // Safe queueing remains the default; ticking the destructive opt-in
+        // immediately makes the button say what clicking it will do.
+        var forceUpgradeEl = document.getElementById('aicli-force-upgrade');
+        var confirmUpgradeEl = document.querySelector('.sweet-alert button.confirm');
+        if (forceUpgradeEl && confirmUpgradeEl) {
+            var syncUpgradeConfirmLabel = function() {
+                confirmUpgradeEl.textContent = forceUpgradeEl.checked
+                    ? 'Force upgrade now'
+                    : 'Queue upgrade safely';
+            };
+            forceUpgradeEl.addEventListener('change', syncUpgradeConfirmLabel);
+            syncUpgradeConfirmLabel();
+        }
 
         // swal renders synchronously — the overlay DOM exists now, so paint
         // the initial estimate into it.
@@ -285,7 +319,7 @@ function _showUpgradeBackupOverlay(id, version, btn, sessions) {
     });
 }
 
-function doInstall(id, version, btn, sessionsToClose, backupOpts) {
+function doInstall(id, version, btn, sessionsToClose, backupOpts, forceNow) {
     // The click source can be a <button> OR a <select> (version picker). For
     // a select, mutating innerHTML would nuke the options, so we only swap
     // the waiting-state content on real buttons and just disable the select.
@@ -299,21 +333,17 @@ function doInstall(id, version, btn, sessionsToClose, backupOpts) {
     $(btn).prop('disabled', true);
     if (!isSelect) $(btn).html('<i class="fa fa-spinner fa-spin"></i> WAIT...');
 
-    // Render the progress panel IMMEDIATELY on click + broadcast install-
-    // start so every other tab (Terminal) transitions to the holding
-    // overlay BEFORE the ~1.8 s server round-trip where _closeSessionsForUpgrade
-    // does Ctrl-C + sleeps. Previously the broadcast fired inside
-    // startInstallPolling which only runs AFTER install_agent returns —
-    // leaving a noticeable dead window where the progress bar showed
-    // "Starting installation…" and the terminal tab hadn't yet reacted.
+    var safeQueue = !!(sessionsToClose && sessionsToClose > 0 && !forceNow);
     _hideButtons(buttons);
-    bar.css('width', '5%');
+    bar.css('width', safeQueue ? '1%' : '5%');
     // Status text reflects what the server is actually doing in the first
     // ~1.8 s window: if sessions were listed in the confirm modal, the
     // backend is running _closeSessionsForUpgrade (Ctrl-C + sleep + sentinel);
     // otherwise it's starting install-bg directly. The real install-status
     // JSON takes over once polling kicks in.
-    if (sessionsToClose && sessionsToClose > 0) {
+    if (safeQueue) {
+        status.text('Queueing safely — active sessions will keep running…');
+    } else if (sessionsToClose && sessionsToClose > 0) {
         status.text('Closing ' + sessionsToClose + ' active session' + (sessionsToClose === 1 ? '' : 's') + '…');
     } else if (backupOpts && backupOpts.backup) {
         status.text('Backing up current version…');
@@ -321,10 +351,15 @@ function doInstall(id, version, btn, sessionsToClose, backupOpts) {
         status.text('Preparing installation…');
     }
     progress.removeAttr('style').addClass('active');
-    _broadcastInstall('install-start', id, { at: 'doInstall-enter' });
+    // Only an explicitly forced install enters terminal holding before AJAX,
+    // because that backend path may begin closure inside the request. Ordinary
+    // installs wait for the authoritative response: it may safely queue after
+    // detecting a terminal-start race.
+    if (forceNow) _broadcastInstall('install-start', id, { at: 'doInstall-force' });
 
     var url = '/plugins/unraid-aicliagents/AICliAjax.php?action=install_agent&agentId=' + id + '&csrf_token=' + csrf;
     if (version) url += '&version=' + encodeURIComponent(version);
+    if (forceNow) url += '&force=1';
     // WP #964 (slice): request a pre-upgrade backup of the current version.
     if (backupOpts && backupOpts.backup && backupOpts.dest) {
         url += '&backup=1&backup_dest=' + encodeURIComponent(backupOpts.dest);
@@ -341,6 +376,13 @@ function doInstall(id, version, btn, sessionsToClose, backupOpts) {
             if (!isSelect) $(btn).html(originalContent);
             _broadcastInstall('install-complete', id, { success: false, message: r.message || 'install refused' });
             return;
+        }
+        if (r.status === 'queued') {
+            bar.css('width', '1%');
+            status.text(r.message || 'Upgrade queued safely — waiting for active sessions to close');
+        } else if (!forceNow) {
+            // The backend acquired admission, raised its barrier, and started.
+            _broadcastInstall('install-start', id, { at: 'install-admitted' });
         }
         startInstallPolling(id, progress, bar, status, buttons, btn, originalContent);
     }).fail(function(xhr) {
@@ -467,7 +509,7 @@ function populateVersionPicker(id, data) {
     if (!select) return;
 
     var installed = data.installed || '0.0.0';
-    var channel = data.channel || 'latest';
+    var channel = data.channel || 'stable';
     select.setAttribute('data-installed', installed);
     // Safe clear — avoids innerHTML which the security hook will block.
     while (select.firstChild) select.removeChild(select.firstChild);
@@ -505,13 +547,13 @@ function populateVersionPicker(id, data) {
         });
     });
 
-    // Pre-release filter: on the 'latest' channel hide versions whose dist-tags
+    // Pre-release filter: on the Stable channel hide versions whose dist-tags
     // are exclusively pre-release markers. Codex-CLI exposes alpha-linux-x64,
     // alpha, etc. in its npm dist-tags — they should not appear in a stable picker.
     // A version with no tags (untagged) or with at least one non-pre-release tag
     // (e.g. 'latest') is always kept.
     var preReleaseRe = /alpha|beta|canary|nightly|snapshot|next(?:-\d|$)|rc(?:\d|$)|dev[-_]build|pre[-_]?release/i;
-    if (channel === 'latest' || channel === 'stable') {
+    if (channel === 'stable' || channel === 'latest') {
         compatibleVersions = compatibleVersions.filter(function(v) {
             var tags = v.tags || [];
             if (tags.length === 0) return true;
@@ -675,7 +717,10 @@ function onVersionSelect(select) {
     var selectedOpt = select.options[select.selectedIndex];
     var text = selectedOpt ? selectedOpt.textContent : '';
     var tagMatch = text.match(/\[(\w+)\]/);
-    var channel = tagMatch ? tagMatch[1] : 'latest';
+    var channel = tagMatch ? tagMatch[1] : 'stable';
+    // `latest` is a release tag, not the user-facing Stable channel. Older
+    // builds conflated the two and could install a newer, less-tested release.
+    if (channel === 'latest') channel = 'stable';
     $.getJSON('/plugins/unraid-aicliagents/AICliAjax.php?action=set_agent_channel&agentId='
               + encodeURIComponent(id) + '&channel=' + encodeURIComponent(channel)
               + '&csrf_token=' + csrf);
@@ -1183,7 +1228,7 @@ const AV2_TMUX_HELP = {
     'prefix':            'Command prefix key (default C-b). Every tmux keybinding is triggered by this combo first.',
     'base-index':        'Index of the first window — 0 matches shell conventions, 1 matches keyboard number row.',
     'bell-action':       'Which pane triggers a bell alert: any, none, current (focused only), other (unfocused only).',
-    'default-terminal':  'TERM value exported to programs (default: xterm-256color). xterm-256color is broadly compatible; tmux-256color enables italics but requires terminfo on the server.',
+    'default-terminal':  'TERM value exported to programs (default: tmux-256color). tmux-256color enables italics and ships its terminfo bundled with the plugin; the shell falls back to xterm-256color automatically if that terminfo cannot be compiled.',
     'focus-events':      'Forward focus-gained/focus-lost escape codes to apps (needed for vim/nvim auto-reload).',
     'allow-passthrough': 'Allow OSC escape sequences to pass through tmux — enables inline images, hyperlinks.',
 };
@@ -1374,90 +1419,72 @@ function av2ResetAllTmux(btn) {
 // ----- Auto-Launch workspace section (appended to Terminal chip panel) -----
 
 function av2LoadAutoLaunchSection(agentId, panelBody) {
-    // Sanitise an agent/workspace id for use as an HTML attribute. Server-supplied
-    // but never user-typed in practice; defensive guard so for/id pairings stay valid
-    // even if an id ever contains spaces or punctuation.
+    // Sanitise an agent id for use as an HTML attribute. Server-supplied but never
+    // user-typed in practice; defensive guard so for/id pairings stay valid.
     const sanitiseId = function(s) {
         return String(s == null ? '' : s).replace(/[^a-zA-Z0-9_-]/g, '_');
     };
-    // Resolve a human-friendly workspace label. The terminal UI stores workspace
-    // names under .name; legacy data may carry .title; on bare-/ workspaces both
-    // can be empty, so fall back to the last path segment ("Root" for /).
-    const labelFor = function(ws) {
-        if (ws.name)  return ws.name;
-        if (ws.title) return ws.title;
-        if (!ws.path || ws.path === '/') return 'Root';
-        const tail = ws.path.replace(/\/+$/, '').split('/').pop();
-        return tail || ws.path;
-    };
 
+    // R-C1: auto-launch is now an AGENT-LEVEL setting — one toggle that governs
+    // EVERY workspace of this agent (and relaunches them all after a plugin
+    // upgrade), instead of a row per workspace.
     $.getJSON(
         '/plugins/unraid-aicliagents/AICliAjax.php?action=get_auto_launch&agentId=' +
         encodeURIComponent(agentId) + '&csrf_token=' + csrf,
         function(r) {
-            if (r.status !== 'ok' || !r.workspaces || r.workspaces.length === 0) return;
+            if (r.status !== 'ok') return;
+
+            const armed = !!r.autoLaunch;
+            const count = r.workspaceCount || 0;
+            const uid   = 'al-' + sanitiseId(agentId);
 
             const section = av2mkel('div', {class: 'av2-al-section'}, []);
-            section.appendChild(av2mkel('p', {class: 'av2-al-eyebrow'}, ['⚡ Auto-launch on open']));
+            section.appendChild(av2mkel('p', {class: 'av2-al-eyebrow'}, ['⚡ Keep saved workspaces running']));
             section.appendChild(av2mkel('p', {class: 'av2-al-caption'}, [
-                'These workspaces start automatically when the AI Agents page opens or after a plugin upgrade.'
+                'When enabled, ALL of this agent’s workspaces (' + count +
+                ') start after reboot and are recreated if their agent exits. Switch this off to opt out.'
             ]));
 
             const saveNote = av2mkel('span', {class: 'av2-save-note', style: 'display:inline-block; margin-top:8px;'}, ['']);
 
-            r.workspaces.forEach(function(ws) {
-                const uid    = 'al-' + sanitiseId(agentId) + '-' + sanitiseId(ws.id);
-                const armed  = !!ws.autoLaunch;
-                const wsPath = ws.path || '/';
+            const row = av2mkel('div', {class: 'av2-al-row' + (armed ? ' armed' : '')}, []);
 
-                const row = av2mkel('div', {
-                    class: 'av2-al-row' + (armed ? ' armed' : ''),
-                    title: wsPath,
-                }, []);
+            const chkAuto = av2mkel('input', {type: 'checkbox', id: uid});
+            if (armed) chkAuto.checked = true;
 
-                row.appendChild(av2mkel('div', {class: 'av2-al-id'}, [
-                    av2mkel('span', {class: 'av2-al-name'}, [labelFor(ws)]),
-                    av2mkel('span', {class: 'av2-al-path'}, [wsPath]),
-                ]));
+            const chkFresh = av2mkel('input', {type: 'checkbox', id: uid + '-fresh'});
+            if (r.freshIfNoResume) chkFresh.checked = true;
 
-                const chkAuto = av2mkel('input', {type: 'checkbox', id: uid});
-                if (armed) chkAuto.checked = true;
+            row.appendChild(av2mkel('label', {class: 'av2-al-toggle', 'for': uid}, [
+                chkAuto,
+                av2mkel('span', {}, ['Restart all saved workspaces']),
+            ]));
 
-                const chkFresh = av2mkel('input', {type: 'checkbox', id: uid + '-fresh'});
-                if (ws.freshIfNoResume) chkFresh.checked = true;
+            row.appendChild(av2mkel('div', {class: 'av2-al-fresh'}, [
+                chkFresh,
+                av2mkel('label', {'for': uid + '-fresh'}, ['Start fresh if no resume']),
+            ]));
 
-                row.appendChild(av2mkel('label', {class: 'av2-al-toggle', 'for': uid}, [
-                    chkAuto,
-                    av2mkel('span', {}, ['Auto-launch']),
-                ]));
-
-                row.appendChild(av2mkel('div', {class: 'av2-al-fresh'}, [
-                    chkFresh,
-                    av2mkel('label', {'for': uid + '-fresh'}, ['Start fresh if no resume']),
-                ]));
-
-                chkAuto.addEventListener('change', function() {
-                    if (chkAuto.checked) {
-                        row.classList.add('armed');
-                    } else {
-                        row.classList.remove('armed');
-                        chkFresh.checked = false;
-                    }
-                    av2SaveAutoLaunch(agentId, ws.path, chkAuto.checked, chkFresh.checked, saveNote);
-                });
-                chkFresh.addEventListener('change', function() {
-                    av2SaveAutoLaunch(agentId, ws.path, chkAuto.checked, chkFresh.checked, saveNote);
-                });
-
-                section.appendChild(row);
+            chkAuto.addEventListener('change', function() {
+                if (chkAuto.checked) {
+                    row.classList.add('armed');
+                } else {
+                    row.classList.remove('armed');
+                    chkFresh.checked = false;
+                }
+                av2SaveAutoLaunch(agentId, chkAuto.checked, chkFresh.checked, saveNote);
+            });
+            chkFresh.addEventListener('change', function() {
+                av2SaveAutoLaunch(agentId, chkAuto.checked, chkFresh.checked, saveNote);
             });
 
+            section.appendChild(row);
             section.appendChild(saveNote);
             panelBody.appendChild(section);
         }
     ).fail(function() {
         // Network error or non-200 — surface a small error line so a silent
-        // miss isn't mistaken for "no workspaces have auto-launch flags".
+        // miss isn't mistaken for "auto-launch unavailable".
         const errEl = av2mkel('div', {class: 'av2-help', style: 'margin-top:12px; opacity:0.6;'}, [
             'Auto-launch section failed to load.',
         ]);
@@ -1465,14 +1492,13 @@ function av2LoadAutoLaunchSection(agentId, panelBody) {
     });
 }
 
-function av2SaveAutoLaunch(agentId, path, autoLaunch, freshIfNoResume, noteEl) {
+function av2SaveAutoLaunch(agentId, autoLaunch, freshIfNoResume, noteEl) {
     if (noteEl) { noteEl.textContent = 'Saving…'; noteEl.className = 'av2-save-note'; }
     $.ajax({
         url: '/plugins/unraid-aicliagents/AICliAjax.php?action=save_auto_launch',
         method: 'POST',
         data: {
             agentId:         agentId,
-            path:            path,
             autoLaunch:      autoLaunch      ? '1' : '0',
             freshIfNoResume: freshIfNoResume ? '1' : '0',
             csrf_token:      csrf,

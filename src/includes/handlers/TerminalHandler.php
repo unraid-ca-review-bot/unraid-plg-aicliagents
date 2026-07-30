@@ -23,9 +23,11 @@ class TerminalHandler {
             case 'restart':          return self::restart($id);
             case 'agent_signal_reload': return self::agentSignalReload($id);
             case 'get_chat_session': return self::getChatSession();
+            case 'get_session_status': return self::getSessionStatus($id);
             case 'get_resume_id':    return self::getResumeId();
             case 'log':              return self::log();
             case 'get_log':          return self::getLog();
+            case 'get_log_contexts': return self::getLogContexts();
             case 'clear_log':        return self::clearLog();
             case 'list_sessions_for_agent': return self::listSessionsForAgent();
             default:                 return null;
@@ -34,7 +36,7 @@ class TerminalHandler {
 
     /** Actions handled by this handler. */
     public static function actions() {
-        return ['start', 'emergency_start', 'stop', 'graceful_close', 'restart', 'agent_signal_reload', 'get_chat_session', 'get_resume_id', 'log', 'get_log', 'clear_log', 'list_sessions_for_agent'];
+        return ['start', 'emergency_start', 'stop', 'graceful_close', 'restart', 'agent_signal_reload', 'get_chat_session', 'get_session_status', 'get_resume_id', 'log', 'get_log', 'get_log_contexts', 'clear_log', 'list_sessions_for_agent'];
     }
 
     /**
@@ -65,6 +67,37 @@ class TerminalHandler {
         $persistPath = $config['agent_storage_path'] ?? '/boot/config/plugins/unraid-aicliagents';
         $agentId = $_GET['agentId'] ?? 'gemini-cli';
         $workspacePath = $_GET['path'] ?? null;
+
+        // R2 (UPGRADE_RELAUNCH_ZOMBIE_SKIP): never spawn a session while this
+        // agent's binary is being swapped — a `start` that races the upgrade
+        // creates a tmux session whose agent dies instantly (a ZOMBIE), which the
+        // post-upgrade relaunch then wrongly skips → "Terminal session not found".
+        // The manifest-driven relaunch resumes this session automatically when the
+        // upgrade finishes, so refuse here without creating anything.
+        require_once __DIR__ . '/AgentHandler.php';
+        if (\AICliAgents\Handlers\AgentHandler::isInstallInProgress($agentId)) {
+            return [
+                'status'  => 'upgrade_in_progress',
+                'message' => 'Upgrade in progress — this session will resume automatically when the upgrade finishes.',
+            ];
+        }
+
+        // HOME_CONSOLIDATE_INPROGRESS_GUARD R2: never spawn a session while this
+        // user's home is being consolidated — a `start` that races the consolidate
+        // re-pins the home overlay (live merged mount) and the consolidate defers
+        // (mount_busy) forever. StorageHandler::consolidate(home) set the per-user
+        // marker before closing the sessions; refuse here without creating anything.
+        // The consolidate-success hook (relaunchHomeSet) resumes the closed set
+        // automatically, so the closed sessions come back on their own.
+        require_once __DIR__ . '/../services/ConsolidateState.php';
+        $consolidateUser = (string)($config['user'] ?? 'root');
+        if ($consolidateUser === '' || $consolidateUser === '0') $consolidateUser = 'root';
+        if (\AICliAgents\Services\ConsolidateState::isHomeConsolidating($consolidateUser)) {
+            return [
+                'status'  => 'consolidate_in_progress',
+                'message' => 'Home consolidation in progress — this session will resume automatically when it finishes.',
+            ];
+        }
 
         // Check 1: Is the home storage path available?
         $homePath = $config['home_storage_path'] ?? $persistPath;
@@ -102,6 +135,55 @@ class TerminalHandler {
             ];
         }
 
+        // Check 3 — S-08 (#1353, STORAGE_ASYNC_JOBS.md): never block this AJAX
+        // response 10-30 s on a cold home mount. If the home overlay is not
+        // mounted yet, FileStorage::ensureReadyAsync enqueues a supervisor
+        // `mount` job and we return {status:'mounting', job_id} immediately;
+        // the React cold-start flow polls `storage_job_status` and re-fires
+        // `start` when the job lands (the sync ensureReady inside startTerminal
+        // then takes its fast path). ONLY this browser-facing action goes
+        // async: emergency_start, restart, the event scripts and
+        // AutoLaunchService (headless at boot — nobody to poll a job) keep the
+        // synchronous TerminalService path.
+        if (!\AICliAgents\Services\StorageMountService::isEmergencyMode()
+            && !\AICliAgents\Services\StorageMountService::isMigrationInProgress()) {
+            $homeUser = (string)($config['user'] ?? 'root');
+            if ($homeUser === '' || $homeUser === '0') $homeUser = 'root';
+            if (function_exists('posix_getpwnam') && !is_array(@posix_getpwnam($homeUser))) $homeUser = 'root'; // Bug #1053 fallback
+            $ready = \AICliAgents\Services\FileStorage::ensureReadyAsync("home/$homeUser", ['reason' => 'workspace_open']);
+            if (($ready['state'] ?? '') === 'mounting') {
+                // T-09: surface the wait in the start activity so the cold-start
+                // overlay + tray show "mount queued" instead of a silent spinner.
+                \AICliAgents\Services\ActivityService::update("start_$id", [
+                    'type'  => 'start', 'label' => "Starting $agentId",
+                    'step'  => 'mounting_home_queued', 'progress' => 10,
+                    'meta'  => ['sessionId' => $id, 'agentId' => $agentId,
+                                'path' => (string)($workspacePath ?? ''),
+                                'jobId' => (string)($ready['job_id'] ?? '')],
+                ]);
+                return [
+                    'status' => 'mounting',
+                    'job_id' => (string)($ready['job_id'] ?? ''),
+                    'wait_s' => (int)($ready['wait_s'] ?? 300),
+                    'sock'   => "/webterminal/aicliterm-$id/",
+                ];
+            }
+            if (($ready['state'] ?? '') === 'unavailable') {
+                // The async path degraded to sync (queue unavailable) AND the
+                // sync mount failed — same surface as the Check-1 classification.
+                return [
+                    'status'  => 'error',
+                    'reason'  => 'home_unavailable',
+                    'message' => 'Home storage could not be mounted (exit ' . (string)($ready['exit'] ?? '?') . '). Check the Storage tab.',
+                    'path'    => $homePath,
+                    'classification' => \AICliAgents\Services\StorageMountService::classifyPath($homePath),
+                    'emergency_possible' => \AICliAgents\Services\StorageMountService::isPathAvailable($persistPath)
+                        && count(glob("$persistPath/agent_{$agentId}_*.sqsh")) > 0,
+                ];
+            }
+            // state 'ready' (or a deferred-but-usable sync fallback) → proceed.
+        }
+
         // Resume flag: if the user clicked "Resume" in the new-session overlay,
         // pass the sentinel 'auto' so TerminalService looks up the ID saved at
         // the previous clean close. Explicit chatId (if any) still wins.
@@ -109,8 +191,29 @@ class TerminalHandler {
         if (empty($chatId) && !empty($_GET['resume'])) {
             $chatId = 'auto';
         }
-        startAICliTerminal($id, $workspacePath, $chatId, $agentId);
-        return ['status' => 'ok', 'sock' => "/webterminal/aicliterm-$id/"];
+        // #71: serialize the final status check + session registration with
+        // queued-upgrade admission. The earlier check gives fast feedback;
+        // this one closes the in-flight request race.
+        $admission = \AICliAgents\Services\AgentUpgradeAdmissionService::acquire($agentId);
+        if ($admission === null) {
+            return [
+                'status' => 'upgrade_in_progress',
+                'message' => 'Upgrade transition in progress — retrying is safe.',
+            ];
+        }
+        try {
+            // @phpstan-ignore-next-line The supervisor can raise this external status barrier after the earlier check.
+            if (\AICliAgents\Handlers\AgentHandler::isInstallInProgress($agentId)) {
+                return [
+                    'status' => 'upgrade_in_progress',
+                    'message' => 'Upgrade in progress — this session will resume automatically when the upgrade finishes.',
+                ];
+            }
+            startAICliTerminal($id, $workspacePath, $chatId, $agentId);
+            return self::startedResponse($id);
+        } finally {
+            \AICliAgents\Services\AgentUpgradeAdmissionService::release($admission);
+        }
     }
 
     /**
@@ -173,7 +276,7 @@ class TerminalHandler {
 
             if (!$binaryExists) {
                 // Binary not in RAM — try normal sqsh mount
-                $agentMounted = \AICliAgents\Services\StorageMountService::ensureAgentMounted($agentId);
+                $agentMounted = \AICliAgents\Services\FileStorage::ensureReady("agent/$agentId")->ok;   // Epic #1310: facade intent
                 if (!$agentMounted) {
                     return ['status' => 'error', 'message' => "Agent $agentId is not available. Install it to RAM first via the emergency installer."];
                 }
@@ -189,11 +292,30 @@ class TerminalHandler {
         // Start terminal (home is now symlinked to emergency dir, ensureHomeMounted sees the flag)
         startAICliTerminal($id, $path, null, $agentId);
 
-        return ['status' => 'ok', 'sock' => "/webterminal/aicliterm-$id/", 'emergency' => true];
+        return self::startedResponse($id, ['emergency' => true]);
     }
 
     private static function stop($id) {
+        // R5 (CAPTURE_RESUME_ALL_CLOSE_PATHS): the `stop` action is a purely
+        // destructive hard-kill (no quiesce/scrape — that's gracefulClose's job).
+        // Harden it with a fast disk-fallback resume capture BEFORE the kill so
+        // resume isn't lost if this path is ever invoked on a live session.
+        // Prefer the workspace/agent from $_GET (the close button sends them);
+        // fall back to the session's /var/run metadata otherwise.
+        $path    = $_GET['path'] ?? '';
+        $agentId = $_GET['agentId'] ?? '';
+        if ($path !== '' && $agentId !== '') {
+            $diskId = self::discoverLatestSessionId($agentId, $path);
+            if ($diskId !== null && $diskId !== '') {
+                \AICliAgents\Services\ConfigService::saveResumeId($path, $agentId, $diskId);
+            }
+        } else {
+            \AICliAgents\Services\ProcessManager::captureFallbackBeforeKill((string)$id);
+        }
         stopAICliTerminal($id, isset($_GET['hard']));
+        // Closing a session frees the home overlay — wake the supervisor so any
+        // deferred consolidate/bake for that home resumes immediately (#1381).
+        \AICliAgents\Services\SupervisorService::wake();
         return ['status' => 'ok'];
     }
 
@@ -207,6 +329,29 @@ class TerminalHandler {
      * session id is preg_replace'd to alnum+_- only, so no unsafe data can
      * reach any command line.
      */
+    /**
+     * Derive the agentId from a tmux session name of the form
+     * `aicli-agent-<agentId>-<safeId>`. agentId may itself contain dashes
+     * (claude-code, antigravity-cli, codex-cli), so we strip the fixed
+     * `aicli-agent-` prefix and the trailing `-<safeId>` suffix. Returns '' if
+     * the name doesn't match the expected shape.
+     */
+    public static function agentIdFromSessionName(string $sessName, string $safeId): string {
+        $prefix = 'aicli-agent-';
+        if (strncmp($sessName, $prefix, strlen($prefix)) !== 0) {
+            return '';
+        }
+        $s = substr($sessName, strlen($prefix));
+        if ($safeId !== '') {
+            $suffix = '-' . $safeId;
+            $slen = strlen($suffix);
+            if (strlen($s) > $slen && substr($s, -$slen) === $suffix) {
+                $s = substr($s, 0, -$slen);
+            }
+        }
+        return $s;
+    }
+
     private static function gracefulClose($id) {
         $safeId = preg_replace('/[^a-zA-Z0-9_-]/', '', $id);
         $path = $_GET['path'] ?? '';
@@ -226,6 +371,30 @@ class TerminalHandler {
         // with every other tmux call-site (agentSignalReload, AgentHandler,
         // ProcessManager, InstallerService).
         [$sessName, $tmuxSock, $tmuxBin] = \AICliAgents\Services\ProcessManager::findTmuxSessionForId($safeId);
+
+        // Bulk/supervisor close path (forceCloseHome → handle('graceful_close',$id),
+        // shutdown-capture) carries NO $_GET, so workspace+agent arrive empty and
+        // captureResumeForClose can SCRAPE the resume id but cannot SAVE it ("could
+        // not save (missing workspace or agent)") — relaunch then loses precise
+        // resume (e.g. a user-renamed chat). Resolve from the live session itself:
+        // workspace from the per-session .workdir metadata, agentId from the tmux
+        // session name (aicli-agent-<agentId>-<safeId>). Works even when the
+        // registry metadata is 'unknown' (reconnect sessions).
+        if ($path === '') {
+            $wdf = \AICliAgents\Services\UtilityService::getWorkDirFilePath($safeId);
+            if (is_file($wdf)) {
+                $path = trim((string)@file_get_contents($wdf));
+            }
+        }
+        if ($agentId === '' && $sessName !== '') {
+            $agentId = self::agentIdFromSessionName($sessName, $safeId);
+        }
+        // Refresh the grep-able context with whatever we resolved.
+        $ctx = sprintf("session=%s agent=%s workspace=%s",
+            $safeId,
+            $agentId !== '' ? $agentId : 'unknown',
+            $path !== '' ? $path : 'unknown'
+        );
 
         $capturedId = null;
 
@@ -253,9 +422,14 @@ class TerminalHandler {
             @touch("/tmp/unraid-aicliagents/close-$safeId.flag");
             @shell_exec("$tmuxBin send-keys -t $escSess Enter 2>/dev/null");
 
-            // Poll for the tmux session to actually exit. Up to 3s.
+            // Poll for the tmux session to actually exit. Budget is per-session
+            // configurable via `graceful_close_timeout` (seconds, default 3 —
+            // the historical hardcoded value). Clamped to [1, 60] so a typo'd
+            // config value can't hang the close path. See ACTIVITY_TRAY.md.
+            $budget = (int)(getAICliConfig()['graceful_close_timeout'] ?? 3);
+            $budget = max(1, min(60, $budget ?: 3));
             $exited = false;
-            for ($i = 0; $i < 30; $i++) {
+            for ($i = 0; $i < $budget * 10; $i++) {
                 $still = trim((string) shell_exec("$tmuxBin has-session -t $escSess 2>/dev/null && echo y || echo n"));
                 if ($still === 'n') { $exited = true; break; }
                 usleep(100000);
@@ -263,7 +437,7 @@ class TerminalHandler {
             if ($exited) {
                 aicli_log("gracefulClose: tmux session '$sessName' exited cleanly | $ctx", AICLI_LOG_INFO, "TerminalHandler");
             } else {
-                aicli_log("gracefulClose: tmux session '$sessName' did not exit within 3s — falling back to hard stop | $ctx", AICLI_LOG_WARN, "TerminalHandler");
+                aicli_log("gracefulClose: tmux session '$sessName' did not exit within {$budget}s — falling back to hard stop | $ctx", AICLI_LOG_WARN, "TerminalHandler");
             }
         } else {
             aicli_log("gracefulClose: no tmux session found for $ctx — proceeding to hard stop (session may have already died)", AICLI_LOG_WARN, "TerminalHandler");
@@ -305,6 +479,12 @@ class TerminalHandler {
             'workspace_closed_no_forced_bake',
             ['session' => $safeId, 'resume_id' => $capturedId ?: '']
         );
+
+        // Closing the workspace frees the home overlay — wake the supervisor NOW
+        // so a deferred (mount_busy) consolidate/bake for this home resumes
+        // immediately instead of up to one tick later (#1381 felt like nothing
+        // fired on close).
+        \AICliAgents\Services\SupervisorService::wake();
 
         return ['status' => 'ok', 'resume_id' => $capturedId, 'baking' => false];
     }
@@ -397,6 +577,12 @@ class TerminalHandler {
         if ($sessName === '') return null;
         $escSess = escapeshellarg($sessName);
 
+        // #91: capture the agent's authoritative disk metadata BEFORE sending
+        // exit keys. aicli-shell's retry loop can launch a fresh blank session
+        // immediately after Ctrl-C; a post-exit "newest session" scan would
+        // then save that blank id instead of the conversation being closed.
+        $diskFallbackBeforeQuiesce = self::discoverLatestSessionId($agentId, $path);
+
         // Force the tmux window to 220 cols BEFORE Ctrl-C. After ttyd
         // disconnects, the window can shrink to the last negotiated size
         // (often 80 cols or narrower), which wraps copilot's UUID onto two
@@ -477,7 +663,8 @@ class TerminalHandler {
             // Agent-specific disk-based fallback for CLIs that don't print
             // a resume hint on exit (opencode). Looks up the most recent
             // session id from the agent's own metadata store.
-            $capturedId = self::discoverLatestSessionId($agentId, $path);
+            $capturedId = $diskFallbackBeforeQuiesce
+                ?? self::discoverLatestSessionId($agentId, $path);
             if ($capturedId) {
                 aicli_log("captureResumeForClose: exit screen had no resume hint — discovered id=$capturedId from agent metadata | $ctx", AICLI_LOG_INFO, "TerminalHandler");
             }
@@ -504,11 +691,12 @@ class TerminalHandler {
      *
      * Returns null if unavailable or unsupported for the agent.
      */
-    public static function discoverLatestSessionId(string $agentId, string $workspacePath = ''): ?string {
+    public static function discoverLatestSessionId(string $agentId, string $workspacePath = '', ?string $homeDirOverride = null): ?string {
         $config = getAICliConfig();
         $username = $config['user'] ?? 'root';
         if (empty($username)) $username = 'root';
-        $homeDir = \AICliAgents\Services\UtilityService::getWorkDir($username) . "/home";
+        $homeDir = $homeDirOverride
+            ?? (\AICliAgents\Services\UtilityService::getWorkDir($username) . "/home");
 
         if ($agentId === 'opencode') {
             // OpenCode stores sessions in a SQLite DB. Query the most recent one.
@@ -547,6 +735,14 @@ class TerminalHandler {
             return null;
         }
 
+        if ($agentId === 'kimi-code') {
+            return \AICliAgents\Services\TerminalService::kimiCodeResumeId($homeDir, $workspacePath);
+        }
+
+        if ($agentId === 'grok-build') {
+            return \AICliAgents\Services\TerminalService::grokBuildResumeId($homeDir, $workspacePath);
+        }
+
         if ($agentId === 'claude-code') {
             // Claude organises sessions by project — `.claude/projects/<dasherised-cwd>/<uuid>.jsonl`.
             // A globally-newest scan would pick a session from a DIFFERENT
@@ -579,6 +775,16 @@ class TerminalHandler {
                 );
                 foreach ($it as $file) {
                     if ($file->getExtension() !== 'jsonl') continue;
+                    // #71: subagent transcripts are NOT resumable conversations.
+                    // Claude stores them in the same project tree as the main
+                    // session files (basename `agent-<id>.jsonl`, typically under
+                    // a subagents/ dir). The recursive scan here once promoted
+                    // `agent-a1cac446c74dc0fc2` to resume_id — resuming from it
+                    // opens the wrong transcript. Filter to main-conversation
+                    // ids only.
+                    $base = $file->getBasename('.jsonl');
+                    if (strpos($base, 'agent-') === 0) continue;
+                    if (strpos(str_replace('\\', '/', $file->getPathname()), '/subagents/') !== false) continue;
                     $mtime = $file->getMTime();
                     if ($mtime > $newestMtime) {
                         $newestMtime = $mtime;
@@ -586,17 +792,86 @@ class TerminalHandler {
                     }
                 }
             }
-            if ($newestId !== null && preg_match('/^[A-Za-z0-9_-]{20,}$/', $newestId)) return $newestId;
+            // #71: main-conversation ids are GUIDs (8-4-4-4-12 hex). Anything
+            // else found on disk is agent metadata, not a resumable session.
+            if ($newestId !== null && preg_match('/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/', $newestId)) return $newestId;
             return null;
+        }
+
+        if ($agentId === 'codex-cli') {
+            // #91: Codex stores each resumable conversation as JSONL under a
+            // date tree. The filename is not sufficient for workspace routing;
+            // the first session_meta record carries both the authoritative id
+            // and cwd. Restrict to the closing workspace so a newer Codex chat
+            // elsewhere cannot be resumed into this drawer workspace.
+            $dir = "$homeDir/.codex/sessions";
+            if (!is_dir($dir)) return null;
+            $wantedCwd = rtrim(str_replace('\\', '/', $workspacePath), '/');
+            if ($wantedCwd === '') return null;
+            $newestMtime = 0;
+            $newestId = null;
+            $it = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS)
+            );
+            foreach ($it as $file) {
+                if ($file->getExtension() !== 'jsonl') continue;
+                $fh = @fopen($file->getPathname(), 'rb');
+                if ($fh === false) continue;
+                $line = fgets($fh);
+                fclose($fh);
+                if ($line === false) continue;
+                $meta = json_decode($line, true);
+                if (!is_array($meta) || ($meta['type'] ?? '') !== 'session_meta') continue;
+                $payload = $meta['payload'] ?? null;
+                if (!is_array($payload)) continue;
+                $id = (string)($payload['id'] ?? '');
+                $cwd = rtrim(str_replace('\\', '/', (string)($payload['cwd'] ?? '')), '/');
+                if (!preg_match('/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/', $id)) continue;
+                if ($cwd !== $wantedCwd) continue;
+                $mtime = $file->getMTime();
+                if ($mtime > $newestMtime) {
+                    $newestMtime = $mtime;
+                    $newestId = $id;
+                }
+            }
+            return $newestId;
         }
 
         return null;
     }
 
     private static function restart($id) {
-        stopAICliTerminal($id, true);
-        startAICliTerminal($id, $_GET['path'] ?? null, $_GET['chatId'] ?? null, $_GET['agentId'] ?? 'gemini-cli');
-        return ['status' => 'ok'];
+        // Restart is a continue-current-conversation action. Reuse the same
+        // quiesce + pane/disk capture pipeline as Close before replacing the
+        // terminal, so agents whose id is not present in browser state still
+        // resume precisely. `_fresh_` belongs exclusively to Start New Session
+        // and is deliberately converted to auto-resume here.
+        self::gracefulClose($id);
+        // gracefulClose persisted the authoritative pane/disk capture for this
+        // workspace. Resolve it through ConfigService at launch rather than
+        // trusting a browser-held id that may predate an in-TUI /resume switch.
+        $chatId = self::restartChatId($_GET['chatId'] ?? null);
+        startAICliTerminal($id, $_GET['path'] ?? null, $chatId, $_GET['agentId'] ?? 'gemini-cli');
+        return self::startedResponse($id);
+    }
+
+    /**
+     * Return the identity of the ttyd endpoint created by a successful launch.
+     * The browser seeds its iframe key from this response before first render;
+     * otherwise the first status poll changes `unknown` to the already-running
+     * generation and needlessly replaces a healthy, newly attached terminal.
+     */
+    private static function startedResponse($id, array $extra = []): array {
+        return array_merge([
+            'status' => 'ok',
+            'sock' => "/webterminal/aicliterm-$id/",
+            'terminalGeneration' => \AICliAgents\Services\TerminalGenerationService::current((string)$id),
+        ], $extra);
+    }
+
+    /** Resolve the resume selector for an explicit Restart request. */
+    public static function restartChatId(?string $requested): string {
+        return 'auto';
     }
 
     private static function getChatSession() {
@@ -604,6 +879,19 @@ class TerminalHandler {
         $agentId = $_GET['agentId'] ?? 'gemini-cli';
         $chatId = \AICliAgents\Services\TerminalService::findSession($path, $agentId);
         return ['status' => 'ok', 'chatId' => $chatId];
+    }
+
+    /** Cheap active-session probe used to replace stale ttyd iframes. */
+    private static function getSessionStatus($id) {
+        $path = (string)($_GET['path'] ?? '');
+        $agentId = (string)($_GET['agentId'] ?? 'gemini-cli');
+        return [
+            'status' => 'ok',
+            // Preserve the status endpoint's original conversation-sync
+            // contract while adding the ttyd identity used for reconnects.
+            'chatId' => \AICliAgents\Services\TerminalService::findSession($path, $agentId),
+            'terminalGeneration' => \AICliAgents\Services\TerminalGenerationService::current((string)$id),
+        ];
     }
 
     private static function log() {
@@ -616,18 +904,94 @@ class TerminalHandler {
         return ['status' => 'ok'];
     }
 
+    /**
+     * R-07 (#1370): server-side filtered log fetch. Optional params:
+     *   ctx=<string>   — substring match on the [Context] field (or JSONL "ctx")
+     *   trace=<hex>    — exact match on the [t:<id>] field (R-06 join key)
+     *   level=<0-3>    — only lines at or below this level (0=ERR! … 3=DBUG)
+     *   tail=<N>       — last N lines AFTER filtering (default 500, hard cap 2000)
+     * Never ships the whole file: scans at most the last 2000 raw lines.
+     */
     private static function getLog() {
         $type = $_GET['type'] ?? 'debug';
         $logFile = self::resolveLogFile($type);
-        $content = "";
-        if (file_exists($logFile)) {
-            $lines = aicli_tail($logFile, 500);
-            $content = implode("\n", $lines);
-            $content = mb_convert_encoding($content, 'UTF-8', 'UTF-8');
-        } else {
-            $content = "No log entries found for [" . ucfirst($type) . "].";
+        if (!file_exists($logFile)) {
+            return ['status' => 'ok', 'content' => "No log entries found for [" . ucfirst($type) . "]."];
         }
-        return ['status' => 'ok', 'content' => $content];
+
+        $tail = (int)($_GET['tail'] ?? 500);
+        $tail = max(1, min(2000, $tail ?: 500));
+        $ctx   = trim((string)($_GET['ctx'] ?? ''));
+        $trace = trim((string)($_GET['trace'] ?? ''));
+        if ($trace !== '' && !preg_match('/^[a-z0-9]{4,16}$/', $trace)) $trace = '';
+        $levelRaw = $_GET['level'] ?? '';
+        $level = ($levelRaw !== '' && is_numeric($levelRaw)) ? max(0, min(3, (int)$levelRaw)) : null;
+
+        $lines = aicli_tail($logFile, 2000);
+        if ($ctx !== '' || $trace !== '' || $level !== null) {
+            $lines = array_values(array_filter($lines, function ($line) use ($ctx, $trace, $level) {
+                $f = self::parseLogLine($line);
+                if ($f === null) return false; // filters active → unparseable lines drop
+                if ($ctx !== '' && stripos($f['ctx'], $ctx) === false) return false;
+                if ($trace !== '' && $f['trace'] !== $trace) return false;
+                if ($level !== null && ($f['lvl'] === null || $f['lvl'] > $level)) return false;
+                return true;
+            }));
+        }
+        $lines = array_slice($lines, -$tail);
+        $content = mb_convert_encoding(implode("\n", $lines), 'UTF-8', 'UTF-8');
+        return ['status' => 'ok', 'content' => $content, 'lines' => count($lines)];
+    }
+
+    /**
+     * R-07: distinct [Context] values from the recent tail of the debug log —
+     * feeds the Debug Console context-filter dropdown.
+     */
+    private static function getLogContexts() {
+        $logFile = self::resolveLogFile($_GET['type'] ?? 'debug');
+        $contexts = [];
+        if (file_exists($logFile)) {
+            foreach (aicli_tail($logFile, 2000) as $line) {
+                $f = self::parseLogLine($line);
+                if ($f !== null && $f['ctx'] !== '') $contexts[$f['ctx']] = true;
+            }
+        }
+        $list = array_keys($contexts);
+        sort($list, SORT_NATURAL | SORT_FLAG_CASE);
+        return ['status' => 'ok', 'contexts' => $list];
+    }
+
+    /** Levels as logged by LogService, in LOG_* numeric order. */
+    private const LEVEL_STRINGS = ['ERR!' => 0, 'WARN' => 1, 'INFO' => 2, 'DBUG' => 3];
+
+    /**
+     * Parse one debug-log line into ['ctx','trace','lvl'] — handles BOTH the
+     * text format "[ts] [LEVL] [Context] [t:id] msg" and JSONL
+     * {"ts","lvl","ctx","trace","msg"} (debug_log_format=jsonl). Returns null
+     * for lines in neither shape (raw shell echoes parse via the text regex
+     * since they share the [ts] [LEVL] [ctx] prefix convention).
+     * @return array{ctx:string,trace:?string,lvl:?int}|null
+     */
+    private static function parseLogLine(string $line): ?array {
+        $line = trim($line);
+        if ($line === '') return null;
+        if ($line[0] === '{') {
+            $j = json_decode($line, true);
+            if (!is_array($j)) return null;
+            return [
+                'ctx'   => (string)($j['ctx'] ?? ''),
+                'trace' => isset($j['trace']) && $j['trace'] !== null ? (string)$j['trace'] : null,
+                'lvl'   => self::LEVEL_STRINGS[(string)($j['lvl'] ?? '')] ?? null,
+            ];
+        }
+        if (!preg_match('/^\[[^\]]*\] \[([A-Z!]{4})\] \[([^\]]*)\](?: \[t:([a-z0-9]{4,16})\])?/', $line, $m)) {
+            return null;
+        }
+        return [
+            'ctx'   => $m[2],
+            'trace' => isset($m[3]) && $m[3] !== '' ? $m[3] : null,
+            'lvl'   => self::LEVEL_STRINGS[$m[1]] ?? null,
+        ];
     }
 
     private static function clearLog() {

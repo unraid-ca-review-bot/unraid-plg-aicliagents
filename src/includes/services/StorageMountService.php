@@ -3,9 +3,14 @@
  * <module_context>
  *     <name>StorageMountService</name>
  *     <description>Mounting and lifecycle management for AICliAgents storage.</description>
- *     <dependencies>LogService, ConfigService</dependencies>
+ *     <dependencies>LogService, ConfigService, TraceContext</dependencies>
  *     <constraints>Under 150 lines. Manages SquashFS + OverlayFS stacks.</constraints>
  * </module_context>
+ *
+ * @internal Storage-component internal (Epic #1310). Consumers must express intent
+ *           via the FileStorage facade (ensureReady / persist / release / status) —
+ *           never call ensureHomeMounted / ensureAgentMounted / commitChanges
+ *           directly. Enforced by RegressionGuardsTest::testEpic1310ConsumersUseFacadeNotOwnerMethods.
  */
 
 namespace AICliAgents\Services;
@@ -24,20 +29,75 @@ class StorageMountService {
         return file_exists(self::EMERGENCY_FLAG);
     }
 
-    /** Runtime check: is this path usable right now? */
+    /**
+     * S-05 (#1352): the durable degraded flag — written by degraded_state.sh as
+     * the reboot-surviving counterpart of the tmpfs EMERGENCY_FLAG. Lets the UI /
+     * boot-time consumers see that the PREVIOUS session ended degraded even after
+     * the reboot wiped /tmp.
+     *
+     * @return array{active: bool, reason: string|null, set_at: string|null}
+     */
+    public static function degradedState(): array {
+        $path = StoragePathResolver::degradedStatePath();
+        if (!is_file($path)) {
+            return ['active' => false, 'reason' => null, 'set_at' => null];
+        }
+        $decoded = json_decode((string)@file_get_contents($path), true);
+        if (!is_array($decoded)) {
+            return ['active' => true, 'reason' => 'unknown', 'set_at' => null];
+        }
+        return [
+            'active' => true,
+            'reason' => isset($decoded['reason']) ? (string)$decoded['reason'] : 'unknown',
+            'set_at' => isset($decoded['set_at']) ? (string)$decoded['set_at'] : null,
+        ];
+    }
+
+    /**
+     * Is the filesystem that owns $path mounted and safe to write to?
+     *
+     * /mnt/user and /mnt/user0 are ordinary directories on rootfs until shfs
+     * mounts them. Treating those stubs as usable can make a boot-time
+     * auto-launch create files beneath them, which then prevents Unraid from
+     * mounting the user-share filesystem at all. Match mount-table targets
+     * exactly: the former substring check let a /mnt/user0 entry incorrectly
+     * satisfy a /mnt/user check.
+     *
+     * $mounts is an explicit test seam; production callers read /proc/mounts.
+     */
+    public static function isBackingMountAvailable(string $path, ?string $mounts = null): bool {
+        if ($path === '') return false;
+
+        $target = null;
+        if (preg_match('#^/mnt/(user0?)(/|$)#', $path, $m)) {
+            $target = '/mnt/' . $m[1];
+        } elseif (preg_match('#^/mnt/(disk\d+)(/|$)#', $path, $m)) {
+            $target = '/mnt/' . $m[1];
+        }
+
+        if ($target === null) return true;
+        $mounts = $mounts ?? (@file_get_contents('/proc/mounts') ?: '');
+        return self::mountTableHasTarget($mounts, $target);
+    }
+
+    /** Pure parser for /proc/mounts-style rows. */
+    public static function mountTableHasTarget(string $mounts, string $target): bool {
+        foreach (preg_split('/\r?\n/', $mounts) ?: [] as $line) {
+            $fields = preg_split('/\s+/', trim($line));
+            if (!isset($fields[1])) continue;
+            $mountedAt = str_replace(
+                ['\\040', '\\011', '\\012', '\\134'],
+                [' ', "\t", "\n", '\\'],
+                $fields[1]
+            );
+            if ($mountedAt === $target) return true;
+        }
+        return false;
+    }
+
+    /** Runtime check: does this path exist and is its backing storage usable? */
     public static function isPathAvailable(string $path): bool {
-        if (empty($path)) return false;
-        // For /mnt/user/ paths, the directory can exist on tmpfs even when the array is stopped.
-        // mkdir/writes succeed but data goes to RAM and is lost. Check if shfs is actually mounted.
-        if (preg_match('#^/mnt/user0?(/|$)#', $path)) {
-            $mounts = @file_get_contents('/proc/mounts') ?: '';
-            if (strpos($mounts, 'shfs /mnt/user') === false) return false;
-        }
-        // For /mnt/disk* paths (individual array disks), check if the specific disk is mounted
-        if (preg_match('#^/mnt/(disk\d+)(/|$)#', $path, $m)) {
-            $mounts = $mounts ?? (@file_get_contents('/proc/mounts') ?: '');
-            if (strpos($mounts, " /mnt/{$m[1]} ") === false) return false;
-        }
+        if (!self::isBackingMountAvailable($path)) return false;
         return is_dir($path) && is_readable($path);
     }
 
@@ -69,6 +129,20 @@ class StorageMountService {
     /** Legacy stubs. OverlayFS is always writable via ZRAM. */
     public static function lock() { return true; }
     public static function unlock() { return true; }
+
+    /**
+     * WP #1309: classify a storagectl `mount` exit code as "the entity's
+     * storage is usable right now". After op_mount became busy-safe, a mount
+     * can DEFER (exit 2) when the overlay is busy — it keeps the LIVE mount
+     * (the upper holds all data; only the lower refresh waits for idle), so
+     * exit 2 is a usable mount, not a failure. Pure predicate so the launch
+     * callers (ensureHomeMounted / ensureAgentMounted) share one definition.
+     *   0 → true (mounted/refreshed) · 2 → true (deferred, live mount kept)
+     *   1 / other non-zero → false (hard failure)
+     */
+    public static function mountResultIsUsable(int $res): bool {
+        return $res === 0 || $res === 2;
+    }
 
     /**
      * Ensures the agent binary storage is mounted for a specific agent.
@@ -128,17 +202,28 @@ class StorageMountService {
         return ['mounted' => $mounted, 'failed' => $failed];
     }
 
-    public static function ensureAgentMounted($agentId) {
+    // L5 (WP#1333): optional by-ref $exit surfaces the op_mount exit code (0 ok /
+    // 2 deferred-busy-but-usable / else fail) so FileStorage::ensureReady can report
+    // the 'deferred' state. Default-valued, so existing bool-context callers are
+    // unaffected.
+    public static function ensureAgentMounted($agentId, int &$exit = 0) {
+        $exit = 1;
         if (self::isMigrationInProgress()) return false;
 
         $mnt = self::AGENT_MNT_BASE . "/$agentId";
 
         if (self::isMounted($mnt)) {
-            if (self::isAgentMountHealthy($agentId)) return true;
-            LogService::log("Stale agent mount detected for '$agentId' (binary missing under healthy-looking overlay). Unmounting to rebuild.", LogService::LOG_WARN, "StorageMountService");
-            // nosemgrep: php.lang.security.exec-use.exec-use
-            @shell_exec("umount -l " . escapeshellarg($mnt) . " 2>&1");
-            // fall through to remount via mount_stack.sh below
+            if (self::isAgentMountHealthy($agentId)) { $exit = 0; return true; }
+            // F5 (WP#1328): the THIRD copy-up-poison site WP#1309 missed (homes were
+            // fixed at the ensureHomeMounted comment below). A PHP `umount -l` of a
+            // stale/phantom agent overlay (agent uppers ARE writable) followed by an
+            // op_mount rebind on the SAME upper double-binds it → copy-up poison
+            // (new-file create → ENOENT). REMOVED: op_mount's busy-arbiter adjudicates
+            // by construction (idle phantom → real umount + rebuild; busy overlay →
+            // exit 2 kept live & usable; busy phantom → exit 1 surfaced). Never lazy-
+            // detach-then-rebind in PHP.
+            LogService::log("Stale agent mount detected for '$agentId' (binary missing under healthy-looking overlay). Routing teardown through op_mount's busy-arbiter (no PHP lazy detach).", LogService::LOG_WARN, "StorageMountService");
+            // fall through to op_mount below — the arbiter handles the stale mount.
         }
 
         $persistPath = StoragePathResolver::agentPersistPath();
@@ -153,14 +238,28 @@ class StorageMountService {
         // Phase 5: route through the storagectl dispatcher (op_mount) instead of
         // the mount_stack.sh shim. Exit code is unchanged (0 ok / non-0 fail).
         $script = "/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/storage/storagectl.sh";
+        // R-06: TraceContext::shellPrefix() prepends AICLI_TRACE_ID=<id> (validated
+        // [a-z0-9]{4,16} at setId, so safe to interpolate) — joins this exec's shell
+        // log lines to the originating AJAX request.
         // nosemgrep: php.lang.security.exec-use.exec-use
-        exec("bash " . escapeshellarg($script) . " mount --type agent --id " . escapeshellarg($agentId) . " --persist " . escapeshellarg($persistPath) . " 2>&1", $out, $res);
+        exec(TraceContext::shellPrefix() . "bash " . escapeshellarg($script) . " mount --type agent --id " . escapeshellarg($agentId) . " --persist " . escapeshellarg($persistPath) . " 2>&1", $out, $res);
 
-        if ($res !== 0) {
+        // WP #1309: exit 2 = deferred-busy (the live overlay is kept) → usable.
+        // S-02 (#1352): that contract assumes a LIVE overlay was kept (mount_busy).
+        // A target_not_mounted defer (UD device / pool not yet mounted) exits 2
+        // BEFORE any overlay exists — verify the mount is actually present before
+        // treating the defer as usable.
+        $exit = (int)$res;
+        $usable = self::mountResultIsUsable((int)$res);
+        if ($usable && (int)$res === 2 && !self::isMounted($mnt)) {
+            $usable = false;
+            LogService::log("Agent mount for $agentId deferred with NO live overlay (target not mounted yet?) — treating as unavailable.", LogService::LOG_WARN, "StorageMountService");
+        }
+        if (!$usable) {
             LogService::log("Mount script FAILED for agent $agentId: " . implode("\n", $out), LogService::LOG_ERROR, "StorageMountService");
         }
 
-        return ($res === 0);
+        return $usable;
     }
 
     /**
@@ -171,7 +270,10 @@ class StorageMountService {
      * concurrent callers with a per-user flock so two simultaneous PHP
      * requests cannot both invoke mount_stack.sh.
      */
-    public static function ensureHomeMounted($user) {
+    // L5 (WP#1333): optional by-ref $exit (see ensureAgentMounted) surfaces the
+    // op_mount exit code so ensureReady can report the 'deferred' state.
+    public static function ensureHomeMounted($user, int &$exit = 0) {
+        $exit = 1;
         if (self::isMigrationInProgress()) return false;
 
         $workDir = UtilityService::getWorkDir($user);
@@ -190,10 +292,10 @@ class StorageMountService {
         $forcedUnmount = self::ensureHomeUpperOwnership($user, $mnt);
 
         // Emergency mode: home is a symlink to the temp RAM dir — treat as mounted
-        if (is_link($mnt) && self::isEmergencyMode()) return true;
+        if (is_link($mnt) && self::isEmergencyMode()) { $exit = 0; return true; }
 
         // Fast path: already a healthy overlay mount
-        if (!$forcedUnmount && self::isMounted($mnt) && self::isHomeMountHealthy($user)) return true;
+        if (!$forcedUnmount && self::isMounted($mnt) && self::isHomeMountHealthy($user)) { $exit = 0; return true; }
 
         // Serialize concurrent mounts for the same user with an advisory lock.
         // Losers block until the winner finishes, then re-check before mounting.
@@ -201,10 +303,27 @@ class StorageMountService {
         $lockFile = "/tmp/unraid-aicliagents/home_mount_{$safeUser}.lock";
         $lock = @fopen($lockFile, 'c');
         if ($lock !== false) {
-            flock($lock, LOCK_EX);
+            // Bounded wait: a wedged winner must NOT block this PHP-FPM worker
+            // forever. FPM runs with max_execution_time=0, so AICliAjax's
+            // set_time_limit() is a no-op and a bare blocking LOCK_EX could hang the
+            // request permanently and starve the worker pool (a stuck mount then
+            // makes unrelated requests — e.g. a workspace export — hang too). Poll
+            // LOCK_NB up to ~10s; on timeout proceed anyway: the actual mount
+            // (storagectl op_mount) holds its OWN mount-op lock so we never
+            // double-mount, and the isMounted re-check below short-circuits when the
+            // winner already finished.
+            $lockDeadline = microtime(true) + 10.0;
+            while (!flock($lock, LOCK_EX | LOCK_NB)) {
+                if (microtime(true) >= $lockDeadline) {
+                    LogService::log("Home mount lock wait timed out for $safeUser after 10s — proceeding (winner may be wedged); op_mount lock still serializes.", LogService::LOG_WARN, "StorageMountService");
+                    break;
+                }
+                usleep(100000); // 100ms
+            }
             if (self::isMounted($mnt) && self::isHomeMountHealthy($user)) {
                 flock($lock, LOCK_UN);
                 fclose($lock);
+                $exit = 0;
                 return true;
             }
         }
@@ -217,13 +336,13 @@ class StorageMountService {
             return false;
         }
 
-        // Phantom mount: stale /proc/mounts entry but not a healthy overlay.
-        // Lazy-unmount to clear it, then reassemble the stack cleanly.
-        if (self::isMounted($mnt)) {
-            LogService::log("Stale home mount detected for '$user' (not a healthy overlay). Unmounting to rebuild.", LogService::LOG_WARN, "StorageMountService");
-            // nosemgrep: php.lang.security.exec-use.exec-use
-            @shell_exec("umount -l " . escapeshellarg($mnt) . " 2>&1");
-        }
+        // WP #1309: the second copy-up-poison site (a PHP `umount -l` of a
+        // phantom home mount, immediately followed by an op_mount rebind) is
+        // REMOVED. op_mount's busy-arbiter now handles a phantom safely by
+        // construction: an idle phantom is sync-umounted and rebuilt; a busy
+        // phantom (a non-overlay mount that won't release) surfaces as exit 1
+        // rather than an unsafe lazy-remount. Lazy-umount-then-rebind on the
+        // same upper is exactly what poisons copy-up, so PHP must never do it.
 
         LogService::log("Mounting Home Stack for $user", LogService::LOG_INFO, "StorageMountService");
 
@@ -233,15 +352,33 @@ class StorageMountService {
         // Bug #1054: pass $user as --owner so op_mount chowns the OverlayFS
         // upperdir to the agent user -- otherwise the home overlay mounts but is
         // effectively read-only for non-root agents.
+        // R-06: trace env prefix (see ensureAgentMounted).
         // nosemgrep: php.lang.security.exec-use.exec-use
-        exec("bash " . escapeshellarg($script) . " mount --type home --id " . escapeshellarg($user) . " --persist " . escapeshellarg($persistPath) . " --owner " . escapeshellarg($user) . " 2>&1", $out, $res);
+        exec(TraceContext::shellPrefix() . "bash " . escapeshellarg($script) . " mount --type home --id " . escapeshellarg($user) . " --persist " . escapeshellarg($persistPath) . " --owner " . escapeshellarg($user) . " 2>&1", $out, $res);
 
-        if ($res !== 0) {
+        // WP #1309: exit 2 = deferred-busy. op_mount kept the LIVE overlay (the
+        // upper holds all data; only the lower refresh waits for idle) — that is
+        // a usable, writable home, NOT a failure. Treat it as success so the
+        // user never sees a spurious "Mount script FAILED" for a working mount.
+        // S-02 (#1352): that contract assumes a LIVE overlay was kept. A
+        // target_not_mounted defer (UD device / pool not yet mounted) exits 2
+        // BEFORE any overlay exists — verify the mount is actually present
+        // before treating the defer as usable, or a workspace would open over
+        // an unmounted (tmpfs) home dir.
+        $exit = (int)$res;
+        $usable = self::mountResultIsUsable((int)$res);
+        if ($usable && (int)$res === 2 && !self::isMounted($mnt)) {
+            $usable = false;
+            LogService::log("Home mount for $user deferred with NO live overlay (target not mounted yet?) — treating as unavailable.", LogService::LOG_WARN, "StorageMountService");
+        }
+        if (!$usable) {
             LogService::log("Mount script FAILED for home $user: " . implode("\n", $out), LogService::LOG_ERROR, "StorageMountService");
+        } elseif ((int)$res === 2) {
+            LogService::log("Home mount for $user deferred (busy) — live mount kept; lower refresh deferred to idle.", LogService::LOG_INFO, "StorageMountService");
         }
 
         if ($lock !== false) { flock($lock, LOCK_UN); fclose($lock); }
-        return ($res === 0);
+        return $usable;
     }
 
     /**
@@ -291,11 +428,16 @@ class StorageMountService {
     private static function resolveHomeUpperPath(string $user): ?string {
         $persistPath = StoragePathResolver::homePersistPath($user);
         if (empty($persistPath)) return null;
-        $cmd = "findmnt --noheadings --output FSTYPE --target " . escapeshellarg($persistPath);
-        // nosemgrep: php.lang.security.exec-use.exec-use
-        $fstype = trim((string) @shell_exec($cmd));
         $safeUser = preg_replace('/[^a-zA-Z0-9_.-]/', '_', $user) ?: 'unknown';
-        if ($fstype === 'vfat' || $fstype === '') {
+        // #1322/#1313a: drive the zram-vs-disk upper-mode from the GENUINE device test
+        // (FileStorage::backendForPath -> detect_backend.sh removable/USB), NOT a
+        // vfat-fstype replica — flash device (wear) -> ZRAM upper; durable -> disk
+        // upper. Both PHP and bash _entity_paths now key on the SAME single source
+        // (backend_for), so the upper a mount reads can never diverge from where a bake
+        // writes (a vfat-formatted SSD is no longer mis-treated as a wear-limited stick).
+        require_once __DIR__ . '/FileStorage.php';
+        $backend = FileStorage::backendForPath($persistPath)['backend'];
+        if ($backend === 'flash') {
             return "/tmp/unraid-aicliagents/zram_upper/homes/$safeUser/upper";
         }
         return rtrim($persistPath, '/') . "/_upper/homes/$safeUser";
@@ -352,6 +494,44 @@ class StorageMountService {
     }
 
     /**
+     * Unconditionally remount the agent overlay via op_mount, bypassing the
+     * isAgentMountHealthy fast-path. Used by forceAgentRefresh (R3 verify-live)
+     * to swap a stale lowerdir for the newest baked layer after a deferred
+     * refresh — ensureAgentMounted's healthy-mount short-circuit would silently
+     * keep the old overlay, so a dedicated method is required.
+     *
+     * Delegates entirely to the existing storagectl op_mount dispatch so the
+     * Epic #1310 facade rule stays green: storagectl is never called outside
+     * FileStorage / StorageMountService.
+     *
+     * NOTE: a true return means the remount was DISPATCHED usably (exit 0 or
+     * deferred exit 2), NOT a guarantee the new layer is now live — callers
+     * must re-verify liveness after this call (install-bg.php does via
+     * InstallerService::isAgentLayerLive).
+     */
+    public static function remountAgent(string $agentId): bool
+    {
+        $persistPath = StoragePathResolver::agentPersistPath();
+        if (!self::isPathAvailable($persistPath)) {
+            LogService::log("remountAgent($agentId): storage path $persistPath is not accessible.", LogService::LOG_WARN, "StorageMountService");
+            return false;
+        }
+        $script = "/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/storage/storagectl.sh";
+        // nosemgrep: php.lang.security.exec-use.exec-use
+        exec(TraceContext::shellPrefix() . "bash " . escapeshellarg($script) . " mount --type agent --id " . escapeshellarg($agentId) . " --persist " . escapeshellarg($persistPath) . " 2>&1", $out, $res);
+        $mnt = self::AGENT_MNT_BASE . "/$agentId";
+        $usable = self::mountResultIsUsable((int)$res);
+        if ($usable && (int)$res === 2 && !self::isMounted($mnt)) {
+            $usable = false;
+            LogService::log("Agent mount for $agentId deferred with NO live overlay (target not mounted yet?) — treating as unavailable.", LogService::LOG_WARN, "StorageMountService");
+        }
+        if (!$usable) {
+            LogService::log("remountAgent($agentId): storagectl mount failed (exit $res): " . implode("\n", $out), LogService::LOG_ERROR, "StorageMountService");
+        }
+        return $usable;
+    }
+
+    /**
      * Commits changes from ZRAM to SquashFS.
      *
      * For $type === 'home': delta bake via commit_stack.sh + post-bake threshold
@@ -372,123 +552,27 @@ class StorageMountService {
      * Pure decision (no I/O) so the #1304 data-safety contract is unit-testable:
      *   consolidated            -> 0  (success)
      *   not deferred (real fail)-> 1  (fatal)
-     *   deferred + bake ok      -> 2  (non-fatal; data reached Flash)
+     *   deferred + bake 0 or 2  -> 2  (non-fatal; data reached Flash)
      *   deferred + bake failed  -> 1  (fatal; data NOT on Flash)
      */
     public static function mapAgentCommitResult(bool $consolidated, bool $deferred, int $bakeRc): int {
         if ($consolidated) return 0;
         if (!$deferred)     return 1;          // genuine consolidation failure
-        return $bakeRc === 0 ? 2 : 1;          // deferred: 2 only if the fallback bake saved it
+        // storagectl bake exit 2 means the delta reached durable storage but the
+        // busy live mount could not be refreshed/reclaimed yet. Both 0 and 2 are
+        // therefore safe, non-fatal install outcomes.
+        return ($bakeRc === 0 || $bakeRc === 2) ? 2 : 1;
     }
 
-    public static function commitChanges($type, $id) {
-        // WP #748 J — agents always collapse to a single layer on every install
-        // /upgrade. Bypass commit_stack.sh's delta path entirely.
-        if ($type === 'agent') {
-            $deferred = false;
-            $ok = self::consolidate($type, $id, $deferred);
-
-            // Consolidation deferred (overlay busy) — fall back to a delta bake so
-            // the ZRAM data is at least safe on Flash. Without this, all agent data
-            // lives only in ZRAM and is lost on reboot. The next install consolidates
-            // the delta layers back to a single layer.
-            $bakeRc = 0;
-            if (!$ok && $deferred) {
-                $agentPersistPath = StoragePathResolver::agentPersistPath();
-                $bakeScript = "/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/storage/storagectl.sh";
-                // nosemgrep: php.lang.security.exec-use.exec-use
-                exec("bash " . escapeshellarg($bakeScript) . " bake --type agent --id " . escapeshellarg($id) . " --persist " . escapeshellarg($agentPersistPath), $bakeOut, $bakeRc);
-            }
-
-            // Map (consolidated, deferred, bakeRc) -> 0 ok / 1 fatal / 2 deferred-but-safe.
-            // Pure decision extracted to mapAgentCommitResult() so the data-safety
-            // contract (deferred + bake-ok must NOT be fatal) is unit-tested directly.
-            $code = self::mapAgentCommitResult($ok, $deferred, $bakeRc);
-            if ($code === 1 && !$ok && $deferred) {
-                LogService::log("Agent $id: consolidation deferred AND fallback delta bake failed (rc=$bakeRc) — data remains in ZRAM only.", LogService::LOG_ERROR, "StorageMountService");
-            } elseif ($code === 2) {
-                LogService::log("Agent $id: consolidation deferred; delta bake succeeded — data is safe on Flash, consolidation deferred to next install.", LogService::LOG_WARN, "StorageMountService");
-            }
-            return $code;
-        }
-
-        $persistPath = ($type === 'home')
-            ? StoragePathResolver::homePersistPath($id)
-            : StoragePathResolver::agentPersistPath();
-
-        // Don't attempt bake if the persist path is unavailable
-        if (!self::isPathAvailable($persistPath)) {
-            LogService::log("Persist skipped for $type $id: storage path $persistPath not accessible.", LogService::LOG_WARN, "StorageMountService");
-            return 1;
-        }
-
-        // Phase 5: route through the storagectl dispatcher (op_bake) instead of
-        // the commit_stack.sh shim. Exit code unchanged (0 ok / 1 fail / 2 deferred).
-        $script = "/usr/local/emhttp/plugins/unraid-aicliagents/src/scripts/storage/storagectl.sh";
-
-        $upperDir = StoragePathResolver::zramUpper($type, $id);
-        $dirtyMB = 0;
-        if (is_dir($upperDir)) {
-            $io = shell_exec("du -sm " . escapeshellarg($upperDir) . " 2>/dev/null | cut -f1");
-            $dirtyMB = (int)trim((string)$io);
-        }
-
-        LogService::log("Initiating SquashFS persistence bake for $type $id ($dirtyMB MB dirty)...", LogService::LOG_INFO, "StorageMountService");
-        LifecycleLogService::log(LifecycleLogService::LEVEL_INFO, 'StorageMountService', 'bake_start', ['type' => $type, 'id' => $id, 'dirty_mb' => $dirtyMB, 'persist_path' => $persistPath]);
-        // nosemgrep: php.lang.security.exec-use.exec-use
-        exec("bash " . escapeshellarg($script) . " bake --type " . escapeshellarg($type) . " --id " . escapeshellarg($id) . " --persist " . escapeshellarg($persistPath), $out, $res);
-
-        if ($res === 0) {
-            LogService::log("Successfully persisted $dirtyMB MB of RAM storage to Flash disk for $type $id.", LogService::LOG_INFO, "StorageMountService");
-            LifecycleLogService::log(LifecycleLogService::LEVEL_INFO, 'StorageMountService', 'bake_ok', ['type' => $type, 'id' => $id, 'dirty_mb' => $dirtyMB, 'result' => 0]);
-        } elseif ($res === 2) {
-            // WP #1078: peek (don't consume) the defer-reason marker so the backend
-            // log line names the actual cause. TaskService.php consumes & unlinks
-            // it when building the user-facing message; we only read it here.
-            $sanitisedId = preg_replace('/[^a-zA-Z0-9_-]/', '_', (string)$id);
-            $marker = "/tmp/unraid-aicliagents/.bake_defer_reason_{$type}_{$sanitisedId}";
-            $deferReason = 'unknown';
-            if (is_file($marker)) {
-                $raw = @file_get_contents($marker);
-                if ($raw !== false) $deferReason = trim($raw) ?: 'unknown';
-            }
-            LogService::log("Backed up $dirtyMB MB to Flash for $id, RAM flush deferred (reason=$deferReason).", LogService::LOG_INFO, "StorageMountService");
-            LifecycleLogService::log(LifecycleLogService::LEVEL_INFO, 'StorageMountService', 'bake_deferred', ['type' => $type, 'id' => $id, 'dirty_mb' => $dirtyMB, 'reason' => $deferReason]);
-        } else {
-            LogService::log("FAILED SquashFS persistence bake for $type $id. Check commit_stack.sh output.", LogService::LOG_ERROR, "StorageMountService");
-            LifecycleLogService::log(LifecycleLogService::LEVEL_ERROR, 'StorageMountService', 'bake_failed', ['type' => $type, 'id' => $id, 'result' => $res]);
-        }
-
-        // Phase 1: Write manifest entry after a successful or busy-but-baked commit.
-        // Silent on failure — manifest writes are instrumentation, not load-bearing yet.
-        if ($res === 0 || $res === 2) {
-            $entity = "$type/$id";
-            $sqshFiles = glob("$persistPath/{$type}_{$id}_*.sqsh") ?: [];
-            if (!empty($sqshFiles)) {
-                usort($sqshFiles, static fn($a, $b) => filemtime($b) <=> filemtime($a));
-                $newest = $sqshFiles[0];
-                $sha256 = LayerManifestService::computeFileSha256($newest);
-                LayerManifestService::addLayer($entity, [
-                    'filename'     => basename($newest),
-                    'sha256'       => $sha256 ?? '',
-                    'bytes'        => (int)filesize($newest),
-                    'kind'         => 'delta',
-                    'created_at'   => date('Y-m-d\TH:i:s\Z'),
-                    'persist_path' => $persistPath,
-                ]);
-            }
-        }
-
-        // Phase 5: the count>=5 home auto-consolidate that used to live here is
-        // REMOVED. Home consolidation is now driven by the homes-only policy in
-        // storagectl `status` (layers >= consolidate_max_layers-2, or space
-        // pressure), evaluated each supervisor tick (_check_consolidate_policy),
-        // or by a manual "consolidate now" trigger. Bakes still create deltas here;
-        // consolidation cadence is decoupled from the per-bake layer count, so a
-        // delta no longer forces an expensive re-squash every 5 layers.
-
-        return $res;
-    }
+    // L5 (WP#1333): commitChanges() was DELETED — its persist consumer-policy (the
+    // agent consolidate→delta-bake-fallback and the home bake + logging) moved into
+    // the facade (FileStorage::persist), which now routes through the storagectl seam
+    // directly (op_bake records the manifest under the lock — F6), collapsing the
+    // persist verb to the same depth as release/status. consolidate() /
+    // mapAgentCommitResult() / isPathAvailable() remain here as the helpers the facade
+    // composes; the data-safety contract is still guarded (RegressionGuardsTest now
+    // asserts the agent fallback in FileStorage::persist) + unit-tested
+    // (AgentCommitResultTest::mapAgentCommitResult).
 
 
     /**
@@ -510,8 +594,9 @@ class StorageMountService {
 
         LogService::log("Initiating layer consolidation for $type $id (Current footprint: $oldSizeMB MB)...", LogService::LOG_INFO, "StorageMountService");
         LifecycleLogService::log(LifecycleLogService::LEVEL_INFO, 'StorageMountService', 'consolidate_start', ['type' => $type, 'id' => $id, 'old_size_mb' => $oldSizeMB]);
+        // R-06: trace env prefix (see ensureAgentMounted).
         // nosemgrep: php.lang.security.exec-use.exec-use
-        exec("bash " . escapeshellarg($script) . " consolidate --type " . escapeshellarg($type) . " --id " . escapeshellarg($id) . " --persist " . escapeshellarg($persistPath), $out, $res);
+        exec(TraceContext::shellPrefix() . "bash " . escapeshellarg($script) . " consolidate --type " . escapeshellarg($type) . " --id " . escapeshellarg($id) . " --persist " . escapeshellarg($persistPath), $out, $res);
 
         if ($res === 0) {
             $newSize = 0;
