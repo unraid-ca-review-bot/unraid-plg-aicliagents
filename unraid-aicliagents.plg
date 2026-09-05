@@ -308,39 +308,51 @@
 <!-- MANIFEST: Download Modular Scripts (Installer) -->
 <FILE Name="/tmp/aicli-clean.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/installer/cleanup.sh</URL>
+<SHA256>95117199cf0bbef2fcd92dc45fe22dd66c5f03c4ae8668a048f5685d3d50d92f</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-legacy.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/installer/migrate-from-geminicli.sh</URL>
+<SHA256>2b9bedd8ec730e00f0dadd62b2c87c11a0792505f83742f857c22bc87b0dc24b</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-runtime.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/installer/runtime.sh</URL>
+<SHA256>53bd674b200e7cae05aa22b6c10cfc047d77df1ef8077e6617e65138a7c2ecc6</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-ui.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/installer/ui-assets.sh</URL>
+<SHA256>61ae68743a6da42aa8c33996b932e0ec8fc5fc8033fcd11ec420579c2e8a2474</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-storage.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/installer/storage.sh</URL>
+<SHA256>2a6881ef5d717523f4d5c64baf1c031c1e543a621b89c2b40b18ead7a07d0a96</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-finalize.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/installer/finalize.sh</URL>
+<SHA256>8d029b22c407ec6375c59dbb3171184e560b811b30e89048a5f7e4e851ec4b9f</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-repair.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/user/repair-plugin.sh</URL>
+<SHA256>80eb4eadb27f0538b4c477873555a20904fc23958c48a956c1f7d0ff0eeabaac</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-stop.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/user/stop-plugin.sh</URL>
+<SHA256>2aba4383f4995cefbed1a027c5eb2cde4647bc8ef34e013094c34966ae1b06af</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-stop-warning.page">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/ArrayStopWarning.page</URL>
+<SHA256>41507f80eba4f6c1e74f69c826e6875efdc8c3c61ac9144675122fb41ab0efd8</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-src.tar.gz">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src.tar.gz</URL>
+<SHA256>56507627ca8a5fc62a4a275de62f4538128bcc6c9cfcd61a62865d531dd80282</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-engine.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/installer/install-engine.sh</URL>
+<SHA256>0c25975f71180b1749d7df055f5adf54520b95a90c14c629221c875ebbf4eada</SHA256>
 </FILE>
 <FILE Name="/tmp/aicli-uninstaller.sh">
 <URL>https://raw.githubusercontent.com/johnpwhite/unraid-plg-aicliagents/main/src/scripts/uninstaller/uninstall-engine.sh</URL>
+<SHA256>c90487362b657cf24b1e6657a75950aa21cd07eff251aa36b0aafc4a31da2e65</SHA256>
 </FILE>
 
 <!-- MAIN INSTALL ENGINE -->
